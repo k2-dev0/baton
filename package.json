@@ -1,0 +1,20 @@
+{
+  "name": "codex-model-router",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A fail-closed stdio router for the Codex Desktop app-server.",
+  "bin": {
+    "codex-auto": "bin/codex-auto"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node --check src/policy.mjs && node --check src/proxy.mjs",
+    "test": "vitest run tests/proxy.test.mjs"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.11"
+  }
+}
