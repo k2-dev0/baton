@@ -2,4 +2,5 @@ node_modules/
 config.json
 .agents/
 .codex/
+.serena/
 AGENTS.md
