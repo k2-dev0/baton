@@ -1,25 +1,14 @@
 {
-  "schemaVersion": 1,
-  "mode": "observe",
-  "rulesVersion": "2026-09-06.1",
+  "schemaVersion": 2,
   "enabledRepositories": [
     // モデル切り替えを行うプロジェクトを追加する
     "/Users/kaikojima/Desktop/develop/model-router"
   ],
-  "models": {
-    "default": "gpt-5.6-sol",
-    "escalated": "gpt-6-astra"
-  },
   "efforts": {
     "gpt-5.6-sol": "high",
     "gpt-6-astra": "high"
   },
-  "requestModelPolicy": "preserve",
-  "fixedModel": null,
-  "threadPins": {},
-  "escalatedThreads": {},
   "supportedCliVersions": [
-    "0.153.1",
     "0.153.4"
   ],
   "innerCodexPath": "/Applications/ChatGPT.app/Contents/Resources/codex",
