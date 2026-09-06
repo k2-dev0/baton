@@ -6,8 +6,6 @@ import {
   appendFileSync,
   mkdirSync,
   readFileSync,
-  renameSync,
-  writeFileSync,
   constants as fsConstants,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -15,12 +13,13 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { applySelection, selectModel, validateConfig } from "./policy.mjs";
+import { applySelection, isRepositoryEnabled, selectModel, validateConfig } from "./policy.mjs";
 import { createUnixWebSocketLineServer } from "./websocket.mjs";
 
 const SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.dirname(SOURCE_DIR);
 const DEFAULT_CONFIG_PATH = path.join(PROJECT_DIR, "config.json");
+const SWITCH_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_STATE_DIR = path.join(
   homedir(),
   "Library",
@@ -121,55 +120,6 @@ export class Diagnostics {
   }
 }
 
-export class StateStore {
-  constructor(directory, rulesVersion) {
-    this.directory = directory;
-    this.rulesVersion = rulesVersion;
-    this.file = path.join(directory, "state.json");
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    this.state = this.#load();
-  }
-
-  #load() {
-    try {
-      const parsed = JSON.parse(readFileSync(this.file, "utf8"));
-      if (parsed.schemaVersion !== 1 || !isObject(parsed.threads)) {
-        throw new Error("unsupported state schema");
-      }
-      return { ...parsed, rulesVersion: this.rulesVersion };
-    } catch (error) {
-      if (error?.code !== "ENOENT") {
-        const backup = `${this.file}.invalid-${Date.now()}`;
-        try {
-          renameSync(this.file, backup);
-        } catch {
-          // A missing or concurrently moved file is equivalent to empty state.
-        }
-      }
-      return { schemaVersion: 1, rulesVersion: this.rulesVersion, threads: {} };
-    }
-  }
-
-  getThreads() {
-    return cloneJson(this.state.threads);
-  }
-
-  saveThreads(threads) {
-    this.state = {
-      schemaVersion: 1,
-      rulesVersion: this.rulesVersion,
-      updatedAt: new Date().toISOString(),
-      threads: cloneJson(threads),
-    };
-    const temporary = `${this.file}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(this.state, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    renameSync(temporary, this.file);
-  }
-}
-
 export class MemoryStateStore {
   constructor(initial = {}) {
     this.threads = cloneJson(initial);
@@ -204,6 +154,8 @@ export class RouterEngine {
     this.pending = new Map();
     this.modelCatalog = null;
     this.catalogError = null;
+    this.switches = new Map();
+    this.serverRequests = new Map();
   }
 
   setModelCatalog(entries) {
@@ -230,171 +182,272 @@ export class RouterEngine {
   }
 
   processClientMessage(message) {
-    if (!isObject(message) || typeof message.method !== "string") {
+    if (!isObject(message)) return { type: "forward", message, modified: false };
+    if (hasRequestId(message) && !message.method) this.serverRequests.delete(requestKey(message.id));
+    if (typeof message.method !== "string") return { type: "forward", message, modified: false };
+    if (hasRequestId(message) && (this.pending.has(requestKey(message.id)) ||
+        (typeof message.id === "string" && message.id.startsWith("model-router:switch:")))) {
+      return { type: "local-error", message: this.#localError(message.id, "duplicate or reserved in-flight request id") };
+    }
+    if (message.method === "initialize" && this.compatible) {
+      const changed = cloneJson(message);
+      changed.params ??= {};
+      changed.params.capabilities = { ...changed.params.capabilities, experimentalApi: true };
+      return { type: "forward", message: changed, modified: true };
+    }
+    const threadId = message.params?.threadId;
+    const switching = this.switches.get(threadId);
+    if (["thread/settings/update", "turn/settings/update"].includes(message.method) && hasRequestId(message)) {
+      if (switching) switching.cancelled = true;
+      this.pending.set(requestKey(message.id), { kind: "settings", threadId, method: message.method, params: cloneJson(message.params) });
       return { type: "forward", message, modified: false };
     }
-
-    if (hasRequestId(message) && this.pending.has(requestKey(message.id))) {
-      return {
-        type: "local-error",
-        message: this.#localError(message.id, "duplicate in-flight request id"),
-      };
-    }
-
-    if (["thread/start", "thread/resume", "thread/fork"].includes(message.method)) {
-      if (hasRequestId(message)) {
-        this.pending.set(requestKey(message.id), {
-          kind: "thread-lifecycle",
-          method: message.method,
-          params: cloneJson(message.params ?? {}),
-        });
+    if (switching && ["turn/interrupt", "turn/start", "turn/steer", "thread/archive", "thread/unsubscribe", "thread/rollback", "thread/revert"].includes(message.method)) {
+      switching.cancelled = true;
+      if (["turn/start", "turn/steer"].includes(message.method)) {
+        return { type: "local-error", message: this.#localError(message.id, "Model switch cancelled. Wait for the current turn to stop, then resend this input; it was not submitted.") };
       }
-      return { type: "forward", message, modified: false };
     }
-
+    if (["thread/start", "thread/resume", "thread/fork"].includes(message.method)) {
+      let forwarded = message;
+      if (message.method === "thread/start" && this.compatible &&
+          isRepositoryEnabled(message.params?.cwd ?? process.cwd(), this.config.enabledRepositories)) {
+        const existing = message.params?.dynamicTools ?? [];
+        if (!Array.isArray(existing) || existing.some((tool) => tool.name === "switch_main_model")) {
+          return { type: "local-error", message: this.#localError(message.id, "switch_main_model conflicts with an existing tool") };
+        }
+        forwarded = cloneJson(message);
+        forwarded.params ??= {};
+        forwarded.params.dynamicTools = [...existing, {
+          type: "function", name: "switch_main_model",
+          description: "Switch this main task to the specified model and automatically continue its unfinished work. Call alone, after awaiting other tools and approvals. This ends the current execution segment, not the task. No reason is required.",
+          inputSchema: { type: "object", properties: { model: { type: "string", enum: Object.keys(this.config.efforts) } }, required: ["model"], additionalProperties: false },
+        }];
+      }
+      if (hasRequestId(message)) this.pending.set(requestKey(message.id), {
+        kind: "thread-lifecycle", method: message.method, params: cloneJson(forwarded.params ?? {}),
+      });
+      return { type: "forward", message: forwarded, modified: forwarded !== message };
+    }
     if (message.method !== "turn/start" || !hasRequestId(message) || !isObject(message.params)) {
       return { type: "forward", message, modified: false };
     }
-
-    const threadId = message.params.threadId;
-    const thread = typeof threadId === "string" ? this.threads[threadId] : null;
+    const thread = this.threads[threadId];
     const isNewTurn = Boolean(thread && !thread.activeTurnId && !thread.pendingTurnRequestId);
-    let selection;
-    if (!isNewTurn) {
-      selection = {
-        apply: false,
-        model: null,
-        effort: null,
-        reasonCode: thread ? "active-turn-input" : "thread-state-unknown",
-        advisory: null,
-      };
-    } else if (!this.compatible) {
-      selection = {
-        apply: false,
-        model: null,
-        effort: null,
-        reasonCode: "unsupported-cli-version",
-        advisory: null,
-      };
-    } else {
-      selection = selectModel({ config: this.config, thread, requestParams: message.params });
-    }
-
+    const selection = isNewTurn && this.compatible
+      ? selectModel({ config: this.config, thread, requestParams: message.params })
+      : { apply: false, model: null, effort: null, reasonCode: "preserve" };
     if (selection.apply) {
-      const availabilityError = this.#availabilityError(selection.model, selection.effort);
-      if (availabilityError) {
-        this.diagnostics.record("turn-rejected", {
-          threadId,
-          requestId: message.id,
-          model: selection.model,
-          effort: selection.effort,
-          reasonCode: availabilityError.code,
-        });
-        return {
-          type: "local-error",
-          message: this.#localError(message.id, availabilityError.message),
-        };
-      }
+      const error = this.#availabilityError(selection.model, selection.effort);
+      if (error) return { type: "local-error", message: this.#localError(message.id, error.message) };
     }
-
     const forwarded = selection.apply ? applySelection(message, selection) : message;
     if (isNewTurn) thread.pendingTurnRequestId = requestKey(message.id);
-    const collaborationSettings = isObject(message.params.collaborationMode?.settings)
-      ? message.params.collaborationMode.settings
-      : {};
-    const requestedUserModel =
-      this.config.requestModelPolicy === "preserve"
-        ? message.params.model ?? collaborationSettings.model ?? null
-        : null;
-    const requestedUserEffort =
-      this.config.requestModelPolicy === "preserve"
-        ? message.params.effort ?? collaborationSettings.reasoning_effort ?? null
-        : null;
     this.pending.set(requestKey(message.id), {
-      kind: "turn-start",
-      threadId,
-      isNewTurn,
-      selection,
-      userOverride:
-        isNewTurn &&
-        (typeof requestedUserModel === "string" || typeof requestedUserEffort === "string")
-          ? {
-              model: typeof requestedUserModel === "string" ? requestedUserModel : null,
-              effort:
-                typeof requestedUserEffort === "string"
-                  ? requestedUserEffort
-                  : typeof requestedUserModel === "string"
-                    ? selection.effort
-                    : null,
-            }
-          : null,
-    });
-    this.diagnostics.record("turn-decision", {
-      threadId,
-      requestId: message.id,
-      model: selection.model,
-      effort: selection.effort,
-      reasonCode: selection.reasonCode,
-      advisoryModel: selection.advisory?.model ?? null,
-      advisoryReasonCode: selection.advisory?.reasonCode ?? null,
-      applied: selection.apply,
-      rulesVersion: this.config.rulesVersion,
+      kind: "turn-start", threadId, isNewTurn, selection, params: cloneJson(forwarded.params),
     });
     return { type: "forward", message: forwarded, modified: forwarded !== message };
   }
 
   processServerMessage(message) {
     if (!isObject(message)) return;
-
+    if (message.method === "item/tool/call" && message.params?.tool === "switch_main_model" && message.params?.namespace == null) {
+      return this.switch_main_model(message);
+    }
+    if (isRequest(message)) this.serverRequests.set(requestKey(message.id), message.params?.threadId);
     if (hasRequestId(message) && !message.method) {
       const key = requestKey(message.id);
       const pending = this.pending.get(key);
+      if (pending?.kind === "switch") return this.switch_main_model(message);
+      if (typeof message.id === "string" && message.id.startsWith("model-router:switch:")) {
+        return { consume: true, upstream: [], downstream: [] };
+      }
       if (pending) {
         this.pending.delete(key);
-        if (pending.kind === "thread-lifecycle") {
-          if (message.result?.thread) this.#captureThread(message.result.thread, pending.params);
-        } else if (pending.kind === "turn-start") {
-          this.#settleTurnRequest(pending, message);
+        if (pending.kind === "settings" && message.result?.status === "applied" && pending.method === "turn/settings/update") {
+          const thread = this.threads[pending.threadId];
+          if (thread?.activeTurnId === pending.params.turnId) thread.liveSettings = { ...thread.liveSettings, ...pending.params };
         }
+        if (pending.kind === "thread-lifecycle" && message.result?.thread) {
+          this.#captureThread({ ...message.result.thread,
+            model: message.result.model ?? message.result.thread.model,
+            reasoningEffort: message.result.reasoningEffort ?? message.result.thread.reasoningEffort,
+          }, pending.params);
+        } else if (pending.kind === "turn-start") this.#settleTurnRequest(pending, message);
       }
       return;
     }
-
+    const { threadId, turn, item } = message.params ?? {};
+    const thread = this.threads[threadId];
     if (message.method === "thread/started" && message.params?.thread) {
       this.#captureThread(message.params.thread);
-      return;
-    }
-    if (message.method === "thread/status/changed") {
-      const { threadId, status } = message.params ?? {};
-      const thread = this.threads[threadId];
-      if (!thread || !isObject(status)) return;
-      if (status.type === "idle" || status.type === "notLoaded" || status.type === "systemError") {
-        thread.activeTurnId = null;
-        thread.pendingTurnRequestId = null;
-      } else if (status.type === "active" && !thread.activeTurnId) {
-        thread.activeTurnId = "unknown-active-turn";
+    } else if (message.method === "thread/settings/updated" && thread) {
+      const settings = message.params.threadSettings;
+      thread.selectedModel = settings.model;
+      thread.selectedEffort = settings.effort;
+      if (thread.turnParams && settings.collaborationMode) thread.turnParams.collaborationMode = cloneJson(settings.collaborationMode);
+    } else if (message.method === "turn/started" && thread && typeof turn?.id === "string") {
+      thread.activeTurnId = turn.id;
+    } else if (message.method === "item/started" && thread && item) {
+      if (["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabToolCall", "webSearch"].includes(item.type)) {
+        thread.activeItems[item.id] = item;
       }
-      this.#save();
-      return;
+    } else if (message.method === "item/completed" && thread && item) {
+      delete thread.activeItems[item.id];
+    } else if (message.method === "serverRequest/resolved") {
+      this.serverRequests.delete(requestKey(message.params.requestId));
+    } else if (message.method === "turn/completed" && thread && turn?.id === thread.activeTurnId) {
+      thread.activeTurnId = null;
+      thread.pendingTurnRequestId = null;
+      thread.activeItems = {};
     }
-    if (message.method === "turn/started") {
-      const { threadId, turn } = message.params ?? {};
-      const thread = this.threads[threadId];
-      if (thread && typeof turn?.id === "string") {
+    this.#save();
+    if (message.method === "turn/completed" && this.switches.has(threadId)) return this.switch_main_model(message);
+  }
+
+  // 切り替えツールの待機を区切りにし、Codexの正規手順で同じタスクを続行する。
+  switch_main_model(message) {
+    const action = { consume: message.method !== "turn/completed", upstream: [], downstream: [] };
+    const pending = !message.method ? this.pending.get(requestKey(message.id)) : null;
+    const threadId = pending?.threadId ?? message.params?.threadId;
+    const thread = this.threads[threadId];
+    let state = this.switches.get(threadId);
+    if (message.method === "item/tool/call") {
+      const args = message.params.arguments;
+      const valid = isObject(args) && Object.keys(args).length === 1 &&
+        typeof args.model === "string" && Object.hasOwn(this.config.efforts, args.model);
+      let error = valid ? null : "Specify only a configured model.";
+      if (!this.compatible || thread?.isMain !== true ||
+          !isRepositoryEnabled(thread?.cwd, this.config.enabledRepositories)) error = "This is not an enabled main task.";
+      if (!thread?.turnParams || thread.activeTurnId !== message.params.turnId) error = "The calling turn is no longer active.";
+      if (state) error = "A model switch is already in progress.";
+      if ([...this.pending.values()].some((request) => request.kind === "settings" && request.threadId === threadId)) {
+        error = "Await the user's settings change before switching the model.";
+      }
+      const otherItems = Object.values(thread?.activeItems ?? {}).filter((item) => item.id !== message.params.callId);
+      if (otherItems.length || [...this.serverRequests.values()].includes(threadId)) {
+        error = "Await other tools and approvals before switching the model.";
+      }
+      const effort = valid ? this.config.efforts[args.model] : null;
+      if (!error) error = this.#availabilityError(args.model, effort)?.message ?? null;
+      if (error || args.model === thread?.selectedModel) {
+        action.upstream.push({ id: message.id, result: {
+          success: !error, contentItems: [{ type: "inputText", text: error ?? "The requested model is already active." }],
+        } });
+        return action;
+      }
+      state = { call: cloneJson(message), threadId, turnId: message.params.turnId,
+        model: args.model, effort, phase: "inspect", interrupted: false, interruptAccepted: false, cancelled: false };
+      this.switches.set(threadId, state);
+    } else if (!state) {
+      if (pending) this.pending.delete(requestKey(message.id));
+      return action;
+    } else if (message.method === "turn/completed") {
+      if (message.params.turn?.id !== state.turnId || state.phase !== "interrupt") return action;
+      state.interrupted = message.params.turn.status === "interrupted";
+      if (!state.interrupted || state.cancelled) {
+        this.switches.delete(threadId);
+        return action;
+      }
+      if (!state.interruptAccepted) return action;
+      state.phase = "settings";
+    } else {
+      if (message.error || state.phase !== "interrupt" || state.interrupted) this.pending.delete(requestKey(message.id));
+      if (message.error) {
+        this.switches.delete(threadId);
+        this.diagnostics.record("switch-failed", { threadId, phase: state.phase, error: message.error.message });
+        if (state.phase === "continue" && message.error.message === "model-router: turn/start timed out") {
+          state.cancelled = true;
+          this.switches.set(threadId, state);
+          this.pending.set(requestKey(message.id), pending);
+        }
+        if (!state.interrupted) {
+          action.upstream.push({ id: state.call.id, result: { success: false,
+            contentItems: [{ type: "inputText", text: message.error.message }] } });
+        } else {
+          action.downstream.push({ method: "error", params: { threadId, turnId: state.turnId, willRetry: false,
+            error: { message: "Model switch did not continue: " + message.error.message, codexErrorInfo: null, additionalDetails: null } } });
+        }
+        return action;
+      }
+      if (state.cancelled) {
+        if (state.phase === "inspect") action.upstream.push({ id: state.call.id, result: { success: false,
+          contentItems: [{ type: "inputText", text: "Model switch cancelled by a user operation." }] } });
+        if (state.phase === "continue" && message.result?.turn?.status === "inProgress") {
+          state.phase = "cancel";
+          const id = "model-router:switch:" + randomUUID();
+          this.pending.set(requestKey(id), { kind: "switch", threadId });
+          action.upstream.push({ id, method: "turn/interrupt", params: { threadId, turnId: message.result.turn.id } });
+          return action;
+        }
+        this.switches.delete(threadId);
+        return action;
+      }
+      if (state.phase === "inspect") {
+        const otherWork = Object.values(thread.activeItems).some((item) => item.id !== state.call.params.callId);
+        if (!Array.isArray(message.result?.data) || message.result.data.length || message.result.nextCursor ||
+            otherWork || [...this.serverRequests.values()].includes(threadId) || thread.activeTurnId !== state.turnId) {
+          this.switches.delete(threadId);
+          action.upstream.push({ id: state.call.id, result: { success: false,
+            contentItems: [{ type: "inputText", text: "Background commands are running or their state could not be verified. Await them before switching." }] } });
+          return action;
+        }
+        state.phase = "interrupt";
+      } else if (state.phase === "interrupt") {
+        state.interruptAccepted = true;
+        if (!state.interrupted) return action;
+        state.phase = "settings";
+      } else if (state.phase === "settings") {
+        state.phase = "continue";
+      } else {
+        this.switches.delete(threadId);
+        const turn = message.result?.turn;
+        if (!turn?.id || turn.status !== "inProgress") {
+          action.downstream.push({ method: "error", params: { threadId, turnId: state.turnId, willRetry: false,
+            error: { message: "Model switch did not start an active turn.", codexErrorInfo: null, additionalDetails: null } } });
+          return action;
+        }
         thread.activeTurnId = turn.id;
+        thread.selectedModel = state.model;
+        thread.selectedEffort = state.effort;
+        this.diagnostics.record("switch-accepted", { threadId, turnId: turn.id, model: state.model, effort: state.effort });
         this.#save();
-      }
-      return;
-    }
-    if (message.method === "turn/completed") {
-      const { threadId, turn } = message.params ?? {};
-      const thread = this.threads[threadId];
-      if (thread && (!turn?.id || thread.activeTurnId === turn.id || thread.activeTurnId === "unknown-active-turn")) {
-        thread.activeTurnId = null;
-        thread.pendingTurnRequestId = null;
-        this.#save();
+        return action;
       }
     }
+    const id = "model-router:switch:" + randomUUID();
+    if (state.requestId) this.pending.delete(requestKey(state.requestId));
+    state.requestId = id;
+    let method = "turn/interrupt";
+    let params = { threadId, turnId: state.turnId };
+    if (state.phase === "inspect") {
+      method = "thread/backgroundTerminals/list";
+      params = { threadId };
+    } else if (state.phase === "settings") {
+      method = "thread/settings/update";
+      params = { threadId, model: state.model, effort: state.effort };
+      if (thread.turnParams.collaborationMode) {
+        params.collaborationMode = applySelection({ params: thread.turnParams }, state).params.collaborationMode;
+      }
+    } else if (state.phase === "continue") {
+      method = "turn/start";
+      params = applySelection({ params: thread.turnParams }, state).params;
+      // Sticky設定はCodexの最新値を継承し、古い権限・環境を再適用しない。
+      for (const key of ["cwd", "runtimeWorkspaceRoots", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "permissions", "environments", "serviceTier", "summary", "personality", "multiAgentMode"]) delete params[key];
+      for (const key of ["approvalsReviewer", "summary", "serviceTier"]) {
+        if (Object.hasOwn(thread.liveSettings ?? {}, key)) params[key] = thread.liveSettings[key];
+      }
+      delete params.clientUserMessageId;
+      params.input = [];
+      params.turnTrigger = "model-router";
+      params.toolOutput = { name: "switch_main_model", output: JSON.stringify({
+        model: state.model, status: "applied",
+        message: "Continue the original task from this successful switch; do not repeat completed work. The preceding interruption was performed by model-router, not the user.",
+      }) };
+    }
+    this.pending.set(requestKey(id), { kind: "switch", threadId });
+    action.upstream.push({ id, method, params });
+    return action;
   }
 
   #availabilityError(model, effort) {
@@ -439,11 +492,8 @@ export class RouterEngine {
       pendingTurnRequestId: previous.pendingTurnRequestId ?? null,
       selectedModel: thread.model ?? previous.selectedModel ?? null,
       selectedEffort: thread.reasoningEffort ?? previous.selectedEffort ?? null,
-      reasonCode: previous.reasonCode ?? null,
-      unresolvedReasons: previous.unresolvedReasons ?? [],
-      userModel: previous.userModel ?? null,
-      userEffort: previous.userEffort ?? null,
-      rulesVersion: this.config.rulesVersion,
+      activeItems: previous.activeItems ?? {},
+      turnParams: previous.turnParams ?? null,
     };
     this.#save();
   }
@@ -465,29 +515,12 @@ export class RouterEngine {
     if (typeof turn?.id === "string" && !["completed", "failed", "interrupted"].includes(turn.status)) {
       thread.activeTurnId = turn.id;
     }
-    if (pending.userOverride) {
-      if (pending.userOverride.model) {
-        thread.userModel = pending.userOverride.model;
-        thread.selectedModel = pending.userOverride.model;
-      }
-      if (pending.userOverride.effort) {
-        thread.userEffort = pending.userOverride.effort;
-        thread.selectedEffort = pending.userOverride.effort;
-      }
-    }
-    if (pending.selection.apply) {
-      thread.selectedModel = pending.selection.model;
-      thread.selectedEffort = pending.selection.effort;
-      thread.reasonCode = pending.selection.reasonCode;
-      thread.unresolvedReasons = pending.selection.unresolvedReasons ?? thread.unresolvedReasons ?? [];
-      thread.rulesVersion = this.config.rulesVersion;
-      this.diagnostics.record("turn-selection-accepted", {
-        threadId: pending.threadId,
-        turnId: turn?.id ?? null,
-        model: pending.selection.model,
-        effort: pending.selection.effort,
-        reasonCode: pending.selection.reasonCode,
-      });
+    if (pending.isNewTurn && turn?.id) {
+      thread.liveSettings = {};
+      thread.turnParams = pending.params;
+      const settings = pending.params.collaborationMode?.settings;
+      thread.selectedModel = settings?.model ?? pending.params.model ?? thread.selectedModel;
+      thread.selectedEffort = settings?.reasoning_effort ?? pending.params.effort ?? thread.selectedEffort;
     }
     this.#save();
   }
@@ -586,14 +619,12 @@ export function runAppServerProxy({
   onExit = () => {},
 }) {
   const diagnostics = new Diagnostics(stateDirectory);
-  const stateStore = new StateStore(stateDirectory, config.rulesVersion);
+  const stateStore = new MemoryStateStore();
   const cliVersion = readCliVersion(innerCodexPath);
   const compatible = Boolean(cliVersion && config.supportedCliVersions.includes(cliVersion));
   diagnostics.record("proxy-start", {
     cliVersion,
     compatible,
-    mode: config.mode,
-    rulesVersion: config.rulesVersion,
   });
 
   const engine = new RouterEngine({ config, diagnostics, stateStore, compatible });
@@ -605,6 +636,7 @@ export function runAppServerProxy({
   });
 
   const activeClientRequestIds = new Set();
+  const switchTimers = new Map();
   const gate = {
     internalId: null,
     initializeRequestId: null,
@@ -748,8 +780,25 @@ export function runAppServerProxy({
         if (hasRequestId(message) && !message.method) {
           activeClientRequestIds.delete(requestKey(message.id));
         }
-        engine.processServerMessage(message);
-        writeRespectingBackpressure(clientWritable, `${line}\n`, child.stdout);
+        const action = engine.processServerMessage(message);
+        for (const [id, timer] of switchTimers) {
+          if (!engine.pending.has(requestKey(id))) {
+            clearTimeout(timer);
+            switchTimers.delete(id);
+          }
+        }
+        for (const outgoing of action?.upstream ?? []) {
+          writeRespectingBackpressure(child.stdin, JSON.stringify(outgoing) + "\n", clientReadable);
+          if (outgoing.method) switchTimers.set(outgoing.id, setTimeout(() => {
+            serverDecoder.onLine(JSON.stringify({ id: outgoing.id, error: {
+              code: -32091, message: "model-router: " + outgoing.method + " timed out",
+            } }));
+          }, SWITCH_REQUEST_TIMEOUT_MS));
+        }
+        for (const outgoing of action?.downstream ?? []) {
+          writeRespectingBackpressure(clientWritable, JSON.stringify(outgoing) + "\n", child.stdout);
+        }
+        if (!action?.consume) writeRespectingBackpressure(clientWritable, `${line}\n`, child.stdout);
       } catch (error) {
         failProtocol(error);
       }
@@ -792,6 +841,8 @@ export function runAppServerProxy({
   child.on("error", failProtocol);
   child.on("exit", (code, signal) => {
     childExited = true;
+    for (const timer of switchTimers.values()) clearTimeout(timer);
+    switchTimers.clear();
     clientReadable.pause();
     if (forcedExitTimer) clearTimeout(forcedExitTimer);
     forcedExitTimer = null;
@@ -864,7 +915,6 @@ function printCheck(config, innerCodexPath) {
     cliVersion,
     supportedCliVersions: config.supportedCliVersions,
     innerCodexPath,
-    mode: config.mode,
     enabledRepositories: config.enabledRepositories,
   };
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
