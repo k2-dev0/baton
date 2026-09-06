@@ -3,6 +3,7 @@ import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { test } from "vitest";
 import {
@@ -10,6 +11,7 @@ import {
   MemoryDiagnostics,
   MemoryStateStore,
   RouterEngine,
+  runAppServerProxy,
 } from "../src/proxy.mjs";
 import {
   getAdvisoryRecommendation,
@@ -402,6 +404,110 @@ test("確認済みの未解決理由がある間はAstraを維持する", () => 
   const action = engine.processClientMessage(turnRequest(60, "thread-1"));
   assert.equal(action.message.params.model, "gpt-6-astra");
   assert.equal(action.message.params.effort, "high");
+});
+
+test("initialized通知がなくてもinitialize応答後にモデルカタログを取得する", async () => {
+  const temporary = mkdtempSync(path.join(tmpdir(), "model-router-initialize-"));
+  const fakeCodex = path.join(temporary, "codex");
+  writeFileSync(
+    fakeCodex,
+    `#!/usr/bin/env node
+if (process.argv[2] === "--version") {
+  process.stdout.write("codex-cli 0.153.1\\n");
+  process.exit(0);
+}
+
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const message = JSON.parse(line);
+    if (message.method === "initialize") {
+      process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+    } else if (message.method === "model/list") {
+      process.stdout.write(JSON.stringify({
+        id: message.id,
+        result: {
+          data: [{
+            model: "gpt-6-astra",
+            supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+          }],
+          nextCursor: null,
+        },
+      }) + "\\n");
+    } else if (message.method === "thread/start") {
+      process.stdout.write(JSON.stringify({
+        id: message.id,
+        result: {
+          thread: {
+            id: "thread-1",
+            parentThreadId: null,
+            cwd: ${JSON.stringify(repository)},
+            model: "gpt-5.6-terra",
+            reasoningEffort: "medium",
+            status: { type: "idle" },
+          },
+        },
+      }) + "\\n");
+    } else if (message.method === "turn/start") {
+      process.stdout.write(JSON.stringify({
+        id: message.id,
+        result: { receivedModel: message.params.model },
+      }) + "\\n");
+    }
+  }
+});
+`,
+  );
+  chmodSync(fakeCodex, 0o755);
+
+  const clientReadable = new PassThrough();
+  const clientWritable = new PassThrough();
+  const exited = new Promise((resolve) => {
+    runAppServerProxy({
+      config: makeConfig({ mode: "fixed", fixedModel: "gpt-6-astra" }),
+      innerCodexPath: fakeCodex,
+      args: ["app-server"],
+      stateDirectory: path.join(temporary, "state"),
+      clientReadable,
+      clientWritable,
+      onExit: resolve,
+    });
+  });
+  const turnResponse = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("turn/start response timed out")), 5_000);
+    const decoder = new JsonLineDecoder({
+      maxBufferedBytes: 1024 * 1024,
+      onLine(line) {
+        const message = JSON.parse(line);
+        if (message.id === "initialize") {
+          clientReadable.write(
+            `${JSON.stringify({ method: "thread/start", id: "thread", params: {} })}\n`,
+          );
+        } else if (message.id === "thread") {
+          clientReadable.write(`${JSON.stringify(turnRequest("turn", "thread-1"))}\n`);
+        } else if (message.id === "turn") {
+          clearTimeout(timeout);
+          resolve(message);
+        }
+      },
+    });
+    clientWritable.on("data", (chunk) => decoder.push(chunk));
+  });
+
+  clientReadable.write(
+    `${JSON.stringify({ method: "initialize", id: "initialize", params: {} })}\n`,
+  );
+  const response = await turnResponse;
+  clientReadable.end();
+  await exited;
+
+  assert.equal(response.result?.receivedModel, "gpt-6-astra", response.error?.message);
 });
 
 test("利用不能モデルを代替せず送信前に拒否する", () => {

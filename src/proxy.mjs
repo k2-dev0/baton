@@ -607,6 +607,7 @@ export function runAppServerProxy({
   const activeClientRequestIds = new Set();
   const gate = {
     internalId: null,
+    initializeRequestId: null,
     timeout: null,
     queue: [],
     queuedBytes: 0,
@@ -641,7 +642,10 @@ export function runAppServerProxy({
       writeRespectingBackpressure(clientWritable, `${JSON.stringify(action.message)}\n`, child.stdout);
       return;
     }
-    if (isRequest(action.message)) activeClientRequestIds.add(requestKey(action.message.id));
+    if (isRequest(action.message)) {
+      activeClientRequestIds.add(requestKey(action.message.id));
+      if (action.message.method === "initialize") gate.initializeRequestId = action.message.id;
+    }
     const output = action.modified ? JSON.stringify(action.message) : line;
     writeRespectingBackpressure(child.stdin, `${output}\n`, clientReadable);
   };
@@ -730,6 +734,15 @@ export function runAppServerProxy({
             flushGate();
           }
           return;
+        }
+
+        const isInitializeResponse =
+          gate.initializeRequestId !== null &&
+          sameRequestId(message.id, gate.initializeRequestId) &&
+          !message.method;
+        if (isInitializeResponse) {
+          gate.initializeRequestId = null;
+          if (!message.error) beginCatalogGate();
         }
 
         if (hasRequestId(message) && !message.method) {
