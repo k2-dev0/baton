@@ -16,6 +16,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { applySelection, selectModel, validateConfig } from "./policy.mjs";
+import { createUnixWebSocketLineServer } from "./websocket.mjs";
 
 const SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.dirname(SOURCE_DIR);
@@ -84,8 +85,11 @@ export class JsonLineDecoder {
   }
 
   #checkLimit() {
-    if (Buffer.byteLength(this.buffer, "utf8") > this.maxBufferedBytes) {
-      throw new Error(`protocol line exceeds ${this.maxBufferedBytes} bytes`);
+    const bufferedBytes = Buffer.byteLength(this.buffer, "utf8");
+    if (bufferedBytes > this.maxBufferedBytes) {
+      throw new Error(
+        `protocol line exceeds ${this.maxBufferedBytes} bytes (received at least ${bufferedBytes})`,
+      );
     }
   }
 
@@ -571,7 +575,16 @@ function runPassthrough(innerCodexPath, args) {
 }
 
 // 対応版App Serverとの双方向通信を保ち、新規ターンだけを判定する。
-export function runAppServerProxy({ config, innerCodexPath, args, stateDirectory }) {
+export function runAppServerProxy({
+  config,
+  innerCodexPath,
+  args,
+  stateDirectory,
+  clientReadable = process.stdin,
+  clientWritable = process.stdout,
+  clientName = "Desktop",
+  onExit = () => {},
+}) {
   const diagnostics = new Diagnostics(stateDirectory);
   const stateStore = new StateStore(stateDirectory, config.rulesVersion);
   const cliVersion = readCliVersion(innerCodexPath);
@@ -607,7 +620,7 @@ export function runAppServerProxy({ config, innerCodexPath, args, stateDirectory
 
   const scheduleForcedExit = (exitCode) => {
     if (forcedExitTimer) return;
-    process.stdin.pause();
+    clientReadable.pause();
     forcedExitTimer = setTimeout(() => process.exit(exitCode), 2000);
   };
 
@@ -625,12 +638,12 @@ export function runAppServerProxy({ config, innerCodexPath, args, stateDirectory
   const forwardClientMessage = (line, message) => {
     const action = engine.processClientMessage(message);
     if (action.type === "local-error") {
-      writeRespectingBackpressure(process.stdout, `${JSON.stringify(action.message)}\n`, child.stdout);
+      writeRespectingBackpressure(clientWritable, `${JSON.stringify(action.message)}\n`, child.stdout);
       return;
     }
     if (isRequest(action.message)) activeClientRequestIds.add(requestKey(action.message.id));
     const output = action.modified ? JSON.stringify(action.message) : line;
-    writeRespectingBackpressure(child.stdin, `${output}\n`, process.stdin);
+    writeRespectingBackpressure(child.stdin, `${output}\n`, clientReadable);
   };
 
   const flushGate = () => {
@@ -650,7 +663,7 @@ export function runAppServerProxy({ config, innerCodexPath, args, stateDirectory
       id: gate.internalId,
       params: { cursor, limit: 100, includeHidden: true },
     };
-    writeRespectingBackpressure(child.stdin, `${JSON.stringify(request)}\n`, process.stdin);
+    writeRespectingBackpressure(child.stdin, `${JSON.stringify(request)}\n`, clientReadable);
   };
 
   const beginCatalogGate = () => {
@@ -679,7 +692,7 @@ export function runAppServerProxy({ config, innerCodexPath, args, stateDirectory
     maxBufferedBytes: config.maxBufferedBytes,
     onLine(line) {
       try {
-        const message = parseProtocolLine(line, "Desktop");
+        const message = parseProtocolLine(line, clientName);
         if (gate.internalId !== null) {
           queueBehindGate(line, message);
           return;
@@ -723,14 +736,14 @@ export function runAppServerProxy({ config, innerCodexPath, args, stateDirectory
           activeClientRequestIds.delete(requestKey(message.id));
         }
         engine.processServerMessage(message);
-        writeRespectingBackpressure(process.stdout, `${line}\n`, child.stdout);
+        writeRespectingBackpressure(clientWritable, `${line}\n`, child.stdout);
       } catch (error) {
         failProtocol(error);
       }
     },
   });
 
-  process.stdin.on("data", (chunk) => {
+  clientReadable.on("data", (chunk) => {
     if (childExited || failed) return;
     try {
       clientDecoder.push(chunk);
@@ -738,7 +751,7 @@ export function runAppServerProxy({ config, innerCodexPath, args, stateDirectory
       failProtocol(error);
     }
   });
-  process.stdin.on("end", () => {
+  clientReadable.on("end", () => {
     try {
       clientDecoder.end();
       if (!failed) child.stdin.end();
@@ -746,6 +759,8 @@ export function runAppServerProxy({ config, innerCodexPath, args, stateDirectory
       failProtocol(error);
     }
   });
+  clientReadable.on("error", failProtocol);
+  clientWritable.on("error", failProtocol);
   child.stdout.on("data", (chunk) => {
     try {
       serverDecoder.push(chunk);
@@ -764,7 +779,7 @@ export function runAppServerProxy({ config, innerCodexPath, args, stateDirectory
   child.on("error", failProtocol);
   child.on("exit", (code, signal) => {
     childExited = true;
-    process.stdin.pause();
+    clientReadable.pause();
     if (forcedExitTimer) clearTimeout(forcedExitTimer);
     forcedExitTimer = null;
     diagnostics.record("proxy-exit", { code, signal });
@@ -773,6 +788,7 @@ export function runAppServerProxy({ config, innerCodexPath, args, stateDirectory
       process.exitCode = signalExitCodes[terminatingSignal] ?? 128;
     } else if (signal) process.exitCode = 128;
     else if (!failed) process.exitCode = code ?? 70;
+    onExit({ code, signal });
   });
 
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
@@ -784,6 +800,47 @@ export function runAppServerProxy({ config, innerCodexPath, args, stateDirectory
       scheduleForcedExit(signalExitCodes[signal] ?? 128);
     });
   }
+}
+
+// unix://以外を受け付けず、CLI用socketの対象を絶対パスに限定する。
+function parseUnixListenUrl(listenUrl) {
+  if (!listenUrl.startsWith("unix://")) {
+    throw new Error("router listen URL must use unix://");
+  }
+  const socketPath = listenUrl.slice("unix://".length);
+  if (!path.isAbsolute(socketPath)) {
+    throw new Error("router unix socket path must be absolute");
+  }
+  return socketPath;
+}
+
+// CLI TUIのWebSocketを既存のstdio RouterEngineへ接続する。
+export function runCliWebSocketProxy({ config, innerCodexPath, listenUrl, stateDirectory }) {
+  const socketPath = parseUnixListenUrl(listenUrl);
+  let server;
+  server = createUnixWebSocketLineServer({
+    socketPath,
+    maxPayloadBytes: config.maxBufferedBytes,
+    onConnection(transport) {
+      runAppServerProxy({
+        config,
+        innerCodexPath,
+        args: ["app-server", "--listen", "stdio://"],
+        stateDirectory,
+        clientReadable: transport.readable,
+        clientWritable: transport.writable,
+        clientName: "Codex CLI",
+        onExit() {
+          transport.close();
+          server.close();
+        },
+      });
+    },
+  });
+  server.on("error", (error) => {
+    process.stderr.write(`codex-model-router: ${error.message}\n`);
+    process.exitCode = 70;
+  });
 }
 
 // 起動前診断に必要な互換性情報だけを標準出力へ返す。
@@ -807,6 +864,13 @@ export function main(args = process.argv.slice(2)) {
   const innerCodexPath = resolveInnerCodex(config);
   if (args.length === 1 && args[0] === "--router-check") {
     printCheck(config, innerCodexPath);
+    return;
+  }
+  if (args[0] === "--router-listen") {
+    if (args.length !== 2) throw new Error("--router-listen requires one unix:// URL");
+    const stateDirectory =
+      process.env.CODEX_MODEL_ROUTER_STATE_DIR ?? config.stateDirectory ?? DEFAULT_STATE_DIR;
+    runCliWebSocketProxy({ config, innerCodexPath, listenUrl: args[1], stateDirectory });
     return;
   }
   if (!isAppServerInvocation(args)) {

@@ -19,9 +19,10 @@
   "threadPins": {},
   "escalatedThreads": {},
   "supportedCliVersions": [
-    "0.153.1"
+    "0.153.1",
+    "0.153.4"
   ],
   "innerCodexPath": "/Applications/ChatGPT.app/Contents/Resources/codex",
   "desktopAppPath": "/Applications/ChatGPT.app",
-  "maxBufferedBytes": 1048576
+  "maxBufferedBytes": 33554432
 }

@@ -1,6 +1,6 @@
 # Codex model router
 
-Codex Desktop と同梱 App Server の間で改行区切り JSON を中継し、新規ターンに限ってモデル設定を適用するローカルツールです。Desktop の会話、承認、履歴は既存の仕組みをそのまま使います。
+Codex Desktop または Codex CLI と App Server の間で通信を中継し、新規ターンに限ってモデル設定を適用するローカルツールです。会話、承認、履歴は既存の仕組みをそのまま使います。
 
 ## 現在の安全設定
 
@@ -21,17 +21,27 @@ Codex Desktop と同梱 App Server の間で改行区切り JSON を中継し、
 実行権限を付けた後、まず互換性を確認します。
 
 ```sh
-./bin/codex-auto check
+asp check
 ```
 
-Desktop を通常起動している場合は、実行中タスクを保護するため起動を拒否します。Desktop を手動で終了した後、対象リポジトリで起動します。
+Desktop を通常起動している場合は、実行中タスクを保護するため起動を拒否します。Desktop を手動で終了した後、対象リポジトリで起動します。`.zshrc` を読み込み済みなら、どちらも実行時のカレントディレクトリを対象にします。
 
 ```sh
 cd /path/to/repository
-/Users/kaikojima/Desktop/develop/model-router/bin/codex-auto app
+asp app
+```
+
+CLI 版も同じルーターを経由します。通常の Codex CLI オプションはそのまま後ろへ渡せます。
+
+```sh
+cd /path/to/repository
+asp
+asp --search
 ```
 
 通常起動へ戻すには、タスクを整理して Desktop を終了し、次回は通常の `codex app` を使います。アプリ本体やグローバル環境は変更しません。
+
+CLI 版の接続には [Codex App Server](https://learn.chatgpt.com/docs/app-server) のローカル Unix WebSocket を使います。この接続方式は現時点では実験的です。
 
 ## 設定と記録
 

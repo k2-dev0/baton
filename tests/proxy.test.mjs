@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -17,6 +17,7 @@ import {
   selectModel,
   validateConfig,
 } from "../src/policy.mjs";
+import { WebSocketFrameDecoder } from "../src/websocket.mjs";
 
 const repository = "/Users/test/project";
 const repositoryRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -95,6 +96,20 @@ function turnRequest(id, threadId, overrides = {}) {
   };
 }
 
+// CLIクライアントと同じマスク付きWebSocketフレームをテスト用に組み立てる。
+function maskedFrame(payload, { final = true, opcode = 0x01 } = {}) {
+  const body = Buffer.from(payload);
+  assert.ok(body.length <= 125, "test frame must use the short payload format");
+  const mask = Buffer.from([0x12, 0x34, 0x56, 0x78]);
+  const masked = Buffer.from(body);
+  for (let index = 0; index < masked.length; index += 1) masked[index] ^= mask[index % 4];
+  return Buffer.concat([
+    Buffer.from([(final ? 0x80 : 0x00) | opcode, 0x80 | body.length]),
+    mask,
+    masked,
+  ]);
+}
+
 test("分割到着と複数同時到着のJSON行を復元する", () => {
   const lines = [];
   const decoder = new JsonLineDecoder({ maxBufferedBytes: 1024, onLine: (line) => lines.push(line) });
@@ -107,6 +122,38 @@ test("分割到着と複数同時到着のJSON行を復元する", () => {
 test("上限を超えるプロトコル行を拒否する", () => {
   const decoder = new JsonLineDecoder({ maxBufferedBytes: 8, onLine() {} });
   assert.throws(() => decoder.push(Buffer.from("123456789")), /exceeds 8 bytes/);
+});
+
+test("分割されたWebSocketテキストフレームをCLI入力へ復元する", () => {
+  const messages = [];
+  const errors = [];
+  const decoder = new WebSocketFrameDecoder({
+    maxPayloadBytes: 1024,
+    onText: (message) => messages.push(message),
+    onPing() {},
+    onClose() {},
+    onError: (error) => errors.push(error),
+  });
+  const first = maskedFrame('{"method":"turn/', { final: false });
+  const second = maskedFrame('start"}', { opcode: 0x00 });
+  decoder.push(first.subarray(0, 3));
+  decoder.push(Buffer.concat([first.subarray(3), second]));
+
+  assert.deepEqual(messages, ['{"method":"turn/start"}']);
+  assert.deepEqual(errors, []);
+});
+
+test("マスクされていないWebSocketクライアント入力を拒否する", () => {
+  const errors = [];
+  const decoder = new WebSocketFrameDecoder({
+    maxPayloadBytes: 1024,
+    onText() {},
+    onPing() {},
+    onClose() {},
+    onError: (error) => errors.push(error),
+  });
+  decoder.push(Buffer.from([0x81, 0x02, 0x7b, 0x7d]));
+  assert.match(errors[0].message, /must be masked/);
 });
 
 test("共通接頭辞を持つ別リポジトリを対象に含めない", () => {
@@ -438,7 +485,7 @@ test("Desktopプロセスを検出できない環境では起動しない", () =
   chmodSync(fakePgrep, 0o755);
   chmodSync(fakeCodex, 0o755);
 
-  const result = spawnSync(path.join(repositoryRoot, "bin", "codex-auto"), ["app", repositoryRoot], {
+  const result = spawnSync(path.join(repositoryRoot, "bin", "model-router"), ["app", repositoryRoot], {
     cwd: repositoryRoot,
     env: {
       ...process.env,
@@ -452,6 +499,91 @@ test("Desktopプロセスを検出できない環境では起動しない", () =
     { status: result.status, refused: result.stderr.includes("cannot inspect Desktop process state") },
     { status: 69, refused: true },
   );
+});
+
+test("Desktop版をカレントディレクトリで起動する", () => {
+  const temporary = mkdtempSync(path.join(tmpdir(), "model-router-app-"));
+  const fakePgrep = path.join(temporary, "pgrep");
+  const fakeCodex = path.join(temporary, "codex");
+  const capturePath = path.join(temporary, "arguments.txt");
+  const configPath = path.join(temporary, "config.json");
+  writeFileSync(fakePgrep, "#!/bin/sh\nexit 1\n");
+  writeFileSync(
+    fakeCodex,
+    `#!/bin/sh
+if [ "\${1:-}" = "--version" ]; then
+  printf 'codex-cli 0.153.1\\n'
+  exit 0
+fi
+printf '%s\\n' "$@" > "$CODEX_AUTO_CAPTURE_PATH"
+`,
+  );
+  chmodSync(fakePgrep, 0o755);
+  chmodSync(fakeCodex, 0o755);
+  writeFileSync(configPath, JSON.stringify(makeConfig({ innerCodexPath: fakeCodex })));
+
+  const result = spawnSync(path.join(repositoryRoot, "bin", "model-router"), ["app"], {
+    cwd: repositoryRoot,
+    env: {
+      ...process.env,
+      PATH: `${temporary}:${process.env.PATH}`,
+      CODEX_AUTO_CAPTURE_PATH: capturePath,
+      CODEX_AUTO_CODEX_BIN: fakeCodex,
+      CODEX_MODEL_ROUTER_CONFIG: configPath,
+    },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(readFileSync(capturePath, "utf8").trim().split("\n"), [
+    "app",
+    repositoryRoot,
+  ]);
+});
+
+test("サブコマンドなしでCLI版をカレントディレクトリのルーターへ接続する", () => {
+  const temporary = mkdtempSync(path.join(tmpdir(), "model-router-cli-"));
+  const fakeCodex = path.join(temporary, "codex");
+  const capturePath = path.join(temporary, "arguments.txt");
+  const configPath = path.join(temporary, "config.json");
+  writeFileSync(
+    fakeCodex,
+    `#!/bin/sh
+if [ "\${1:-}" = "--version" ]; then
+  printf 'codex-cli 0.153.4\\n'
+  exit 0
+fi
+if [ "\${1:-}" = "app-server" ]; then
+  while IFS= read -r line; do :; done
+  exit 0
+fi
+printf '%s\\n' "$@" > "$CODEX_AUTO_CAPTURE_PATH"
+`,
+  );
+  chmodSync(fakeCodex, 0o755);
+  writeFileSync(
+    configPath,
+    JSON.stringify(makeConfig({ innerCodexPath: fakeCodex, supportedCliVersions: ["0.153.4"] })),
+  );
+
+  const result = spawnSync(path.join(repositoryRoot, "bin", "model-router"), ["--search"], {
+    cwd: repositoryRoot,
+    env: {
+      ...process.env,
+      CODEX_AUTO_CAPTURE_PATH: capturePath,
+      CODEX_AUTO_CODEX_BIN: fakeCodex,
+      CODEX_MODEL_ROUTER_CONFIG: configPath,
+      CODEX_MODEL_ROUTER_STATE_DIR: path.join(temporary, "state"),
+    },
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const argumentsList = readFileSync(capturePath, "utf8").trim().split("\n");
+  assert.equal(argumentsList[0], "--remote");
+  assert.match(argumentsList[1], /^unix:\/\//u);
+  assert.deepEqual(argumentsList.slice(2), ["-C", repositoryRoot, "--search"]);
 });
 
 test("設定ファイル内の行コメントを許可する", () => {

@@ -3,15 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A fail-closed stdio router for the Codex Desktop app-server.",
+  "description": "A fail-closed model router for Codex Desktop and CLI app-server clients.",
   "bin": {
-    "codex-auto": "bin/codex-auto"
+    "model-router": "bin/model-router"
   },
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "check": "node --check src/policy.mjs && node --check src/proxy.mjs",
+    "check": "node --check src/policy.mjs && node --check src/proxy.mjs && node --check src/websocket.mjs",
     "test": "vitest run tests/proxy.test.mjs"
   },
   "devDependencies": {

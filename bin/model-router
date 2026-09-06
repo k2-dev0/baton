@@ -1,0 +1,145 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+project_dir=$(dirname -- "$script_dir")
+proxy_path="$project_dir/src/proxy.mjs"
+launcher_path=${CODEX_AUTO_CODEX_BIN:-}
+
+if [ -z "$launcher_path" ]; then
+  launcher_path=$(command -v codex || true)
+fi
+
+usage() {
+  printf '%s\n' \
+    "Usage: model-router app [WORKSPACE]" \
+    "       model-router [CODEX_OPTIONS...]" \
+    "       model-router check"
+}
+
+# サブコマンドなしの引数をCodex CLIへそのまま渡す。
+run_cli() {
+  workspace=$(pwd -P)
+  runtime_parent=${TMPDIR:-/tmp}
+  runtime_dir=$(mktemp -d "$runtime_parent/codex-model-router.XXXXXX")
+  socket_path="$runtime_dir/app-server.sock"
+  proxy_pid=""
+
+  cleanup_cli() {
+    if [ -n "$proxy_pid" ] && kill -0 "$proxy_pid" >/dev/null 2>&1; then
+      kill "$proxy_pid" >/dev/null 2>&1 || true
+      wait "$proxy_pid" 2>/dev/null || true
+    fi
+    rm -rf -- "$runtime_dir"
+  }
+  trap cleanup_cli EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  if ! CODEX_MODEL_ROUTER_INNER_CODEX=$launcher_path "$proxy_path" --router-check >/dev/null; then
+    printf '%s\n' "model-router: router compatibility check failed; CLI was not started" >&2
+    exit 78
+  fi
+
+  CODEX_MODEL_ROUTER_INNER_CODEX=$launcher_path \
+    "$proxy_path" --router-listen "unix://$socket_path" &
+  proxy_pid=$!
+  attempt=0
+  while [ ! -S "$socket_path" ]; do
+    if ! kill -0 "$proxy_pid" >/dev/null 2>&1; then
+      wait "$proxy_pid" 2>/dev/null || true
+      printf '%s\n' "model-router: CLI router stopped before accepting connections" >&2
+      exit 70
+    fi
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 100 ]; then
+      printf '%s\n' "model-router: timed out waiting for the CLI router" >&2
+      exit 70
+    fi
+    sleep 0.05
+  done
+
+  set +e
+  CODEX_CLI_PATH= "$launcher_path" --remote "unix://$socket_path" -C "$workspace" "$@"
+  cli_status=$?
+  set -e
+  exit "$cli_status"
+}
+
+if [ -z "$launcher_path" ]; then
+  printf '%s\n' "model-router: codex command was not found" >&2
+  exit 69
+fi
+
+command_name=${1:-}
+case "$command_name" in
+  check)
+    if [ "$#" -ne 1 ]; then
+      usage >&2
+      exit 64
+    fi
+    exec "$proxy_path" --router-check
+    ;;
+  app)
+    if [ "$#" -gt 2 ]; then
+      usage >&2
+      exit 64
+    fi
+    workspace=${2:-.}
+    if [ ! -d "$workspace" ]; then
+      printf '%s\n' "model-router: workspace is not a directory: $workspace" >&2
+      exit 66
+    fi
+    workspace=$(CDPATH= cd -- "$workspace" && pwd -P)
+    ;;
+  cli)
+    shift
+    run_cli "$@"
+    ;;
+  *)
+    run_cli "$@"
+    ;;
+esac
+
+set +e
+pgrep -x ChatGPT >/dev/null 2>&1
+desktop_status=$?
+set -e
+
+case "$desktop_status" in
+  0)
+    set +e
+    pgrep -f "$proxy_path.*app-server" >/dev/null 2>&1
+    router_status=$?
+    set -e
+    case "$router_status" in
+      0) exec "$launcher_path" app "$workspace" ;;
+      1)
+        printf '%s\n' \
+          "model-router: ChatGPT Desktop is already running without the model router." \
+          "Running tasks were not interrupted. Quit Desktop manually, then run this command again." >&2
+        exit 73
+        ;;
+      *)
+        printf '%s\n' "model-router: cannot inspect Desktop process state; Desktop was not started" >&2
+        exit 69
+        ;;
+    esac
+    ;;
+  1) ;;
+  *)
+    printf '%s\n' "model-router: cannot inspect Desktop process state; Desktop was not started" >&2
+    exit 69
+    ;;
+esac
+
+if ! "$proxy_path" --router-check >/dev/null; then
+  printf '%s\n' "model-router: router compatibility check failed; Desktop was not started" >&2
+  exit 78
+fi
+
+CODEX_CLI_PATH=$proxy_path
+export CODEX_CLI_PATH
+exec "$launcher_path" app "$workspace"
