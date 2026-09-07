@@ -5,6 +5,7 @@
     "/Users/kaikojima/Desktop/develop/model-router"
   ],
   "models": {
+    // 切り替えで使用するモデルと設定を追加する
     "gpt-5.6-sol": {
       "effort": "high"
     },
