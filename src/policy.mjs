@@ -1,5 +1,14 @@
 import path from "node:path";
 
+const RESERVED_MODEL_SETTINGS = new Set(["model", "threadId", "turnId", "input", "toolOutput", "turnTrigger", "clientUserMessageId",
+  "cwd", "runtimeWorkspaceRoots", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "permissions", "environments",
+  "collaborationMode", "additionalContext", "multiAgentMode", "cyberAccessProgram", "__proto__", "constructor", "prototype"]);
+
+// モデル設定からタスク識別子・入力・権限などの実行制御を分離する。
+export function isReservedModelSetting(key) {
+  return RESERVED_MODEL_SETTINGS.has(key);
+}
+
 // JSON設定とプロトコル値を、配列を除くオブジェクトとして判定する。
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -37,13 +46,10 @@ export function validateConfig(input) {
   }
   if (!isPlainObject(input.models)) throw new Error("config.models must be an object");
   if (!Object.keys(input.models).length) throw new Error("config.models must contain at least one model");
-  const reservedModelSettings = ["model", "threadId", "turnId", "input", "toolOutput", "turnTrigger", "clientUserMessageId",
-    "cwd", "runtimeWorkspaceRoots", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "permissions", "environments",
-    "collaborationMode", "additionalContext", "multiAgentMode", "cyberAccessProgram"];
   for (const [model, settings] of Object.entries(input.models)) {
     assertString(model, "config.models key");
     if (!isPlainObject(settings)) throw new Error(`config.models.${model} must be an object`);
-    if (Object.keys(settings).some((key) => reservedModelSettings.includes(key))) {
+    if (Object.keys(settings).some(isReservedModelSetting)) {
       throw new Error(`config.models.${model} contains reserved task, input, or permission settings`);
     }
     assertString(settings.effort, `config.models.${model}.effort`);
