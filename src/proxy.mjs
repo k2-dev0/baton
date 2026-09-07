@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   accessSync,
   appendFileSync,
@@ -15,6 +15,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { applySelection, isRepositoryEnabled, selectModel, validateConfig } from "./policy.mjs";
 import { createUnixWebSocketLineServer } from "./websocket.mjs";
+import { checkCliCompatibility } from "./compatibility.mjs";
 
 const SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.dirname(SOURCE_DIR);
@@ -426,6 +427,7 @@ export class RouterEngine {
       params = { threadId };
     } else if (state.phase === "settings") {
       method = "thread/settings/update";
+      // この操作はモデルと思考量の同期用。追加設定一式は続行時のturn/startへ渡す。
       params = { threadId, model: state.model, effort: state.effort };
       if (thread.turnParams.collaborationMode) {
         params.collaborationMode = applySelection({ params: thread.turnParams }, state).params.collaborationMode;
@@ -560,17 +562,6 @@ function resolveInnerCodex(config) {
   return resolved;
 }
 
-// 対象実行ファイルが報告するCodex CLIバージョンだけを取得する。
-export function readCliVersion(innerCodexPath) {
-  const result = spawnSync(innerCodexPath, ["--version"], {
-    encoding: "utf8",
-    env: { ...process.env, CODEX_CLI_PATH: "" },
-  });
-  if (result.error || result.status !== 0) return null;
-  const match = `${result.stdout}\n${result.stderr}`.match(/codex-cli\s+(\S+)/);
-  return match?.[1] ?? null;
-}
-
 // 書き込み先が詰まった間だけ読み取り元を停止して通信量を制御する。
 function writeRespectingBackpressure(writable, data, readable) {
   if (!writable.write(data)) {
@@ -609,7 +600,7 @@ function runPassthrough(innerCodexPath, args) {
   });
 }
 
-// 対応版App Serverとの双方向通信を保ち、新規ターンだけを判定する。
+// 必須通信仕様を持つApp Serverとの双方向通信を保ち、新規ターンだけを判定する。
 export function runAppServerProxy({
   config,
   innerCodexPath,
@@ -622,15 +613,10 @@ export function runAppServerProxy({
 }) {
   const diagnostics = new Diagnostics(stateDirectory);
   const stateStore = new MemoryStateStore();
-  const cliVersion = readCliVersion(innerCodexPath);
-  const compatible = Boolean(cliVersion && config.supportedCliVersions.includes(cliVersion));
-  diagnostics.record("proxy-start", {
-    cliVersion,
-    compatible,
-  });
-
-  const engine = new RouterEngine({ config, diagnostics, stateStore, compatible });
-  if (!compatible) engine.setModelCatalogUnavailable("unsupported CLI version");
+  const compatibility = checkCliCompatibility(innerCodexPath);
+  diagnostics.record("proxy-start", { ...compatibility, compatible: compatibility.ok });
+  if (!compatibility.ok) throw new Error(`incompatible Codex: ${compatibility.reason}`);
+  const engine = new RouterEngine({ config, diagnostics, stateStore });
 
   const child = spawn(innerCodexPath, args, {
     env: { ...process.env, CODEX_CLI_PATH: "" },
@@ -646,7 +632,7 @@ export function runAppServerProxy({
     queue: [],
     queuedBytes: 0,
     catalogEntries: [],
-    finished: !compatible,
+    finished: false,
   };
   let failed = false;
   let childExited = false;
@@ -911,15 +897,13 @@ export function runCliWebSocketProxy({ config, innerCodexPath, listenUrl, stateD
 
 // 起動前診断に必要な互換性情報だけを標準出力へ返す。
 function printCheck(config, innerCodexPath) {
-  const cliVersion = readCliVersion(innerCodexPath);
   const result = {
-    ok: Boolean(cliVersion && config.supportedCliVersions.includes(cliVersion)),
-    cliVersion,
-    supportedCliVersions: config.supportedCliVersions,
+    ...checkCliCompatibility(innerCodexPath),
     innerCodexPath,
     enabledRepositories: config.enabledRepositories,
   };
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  if (!result.ok) process.stderr.write(`codex-model-router: incompatible Codex: ${result.reason}\n`);
   process.exitCode = result.ok ? 0 : 2;
 }
 
