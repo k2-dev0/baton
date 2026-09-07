@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -20,9 +20,105 @@ import {
   validateConfig,
 } from "../src/policy.mjs";
 import { WebSocketFrameDecoder } from "../src/websocket.mjs";
+import { protocol, schemaCommand } from "./fixtures/protocol.mjs";
 
 const repository = "/Users/test/project";
 const repositoryRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+// 公開CLI入口を使い、推論を起動しない互換性検査用の実行環境を作る。
+function compatibilityFixture({ schema = protocol, script = "", version = "9.999.0" } = {}) {
+  const temporary = mkdtempSync(path.join(tmpdir(), "model-router-compatibility-"));
+  const fakeCodex = path.join(temporary, "codex");
+  const calls = path.join(temporary, "calls.jsonl");
+  const configPath = path.join(temporary, "config.json");
+  const config = { ...makeConfig(), innerCodexPath: fakeCodex };
+  writeFileSync(configPath, JSON.stringify(config));
+  const fakePgrep = path.join(temporary, "pgrep");
+  writeFileSync(fakePgrep, "#!/bin/sh\nexit 1\n");
+  chmodSync(fakePgrep, 0o755);
+  writeFileSync(fakeCodex, `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+if (process.argv[2] === "--version") { console.log(${JSON.stringify(`codex-cli ${version}`)}); process.exit(0); }
+${script}
+if (process.argv[3] !== "generate-json-schema") process.exit(99);
+fs.writeFileSync(require("node:path").join(process.argv[process.argv.indexOf("--out") + 1], "codex_app_server_protocol.schemas.json"), ${JSON.stringify(JSON.stringify(schema))});
+`);
+  chmodSync(fakeCodex, 0o755);
+  const env = { ...process.env, PATH: `${temporary}:${process.env.PATH}`, CODEX_MODEL_ROUTER_CONFIG: configPath, CODEX_MODEL_ROUTER_INNER_CODEX: fakeCodex,
+    CODEX_AUTO_CODEX_BIN: fakeCodex, CODEX_MODEL_ROUTER_STATE_DIR: temporary };
+  const run = (args = ["--router-check"], launcher = false) => spawnSync(launcher ? path.join(repositoryRoot, "bin/model-router") : process.execPath,
+    launcher ? args : [path.join(repositoryRoot, "src/proxy.mjs"), ...args], { env, encoding: "utf8", timeout: 15_000 });
+  return { run, calls, configPath };
+}
+
+test("互換性検査は版の登録なしで新しいCodexを受け入れ、タスクを作らない", () => {
+  const { run, calls } = compatibilityFixture();
+  const result = run();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).ok, true);
+  const invocations = readFileSync(calls, "utf8").trim().split("\n").map(JSON.parse);
+  assert.deepEqual(invocations.map((args) => args.slice(0, 2)), [["--version"], ["app-server", "generate-json-schema"]]);
+  assert.equal(invocations[1].includes("--experimental"), true);
+  assert.equal(existsSync(invocations[1][invocations[1].indexOf("--out") + 1]), false);
+});
+
+test("互換性検査は旧バージョン一覧が残っていても版番号で拒否しない", () => {
+  const { run, configPath } = compatibilityFixture();
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  config.supportedCliVersions = ["0.0.0"];
+  writeFileSync(configPath, JSON.stringify(config));
+  assert.equal(run().status, 0);
+});
+
+test("互換性検査では版番号を読めなくても取得できた通信仕様で判定する", () => {
+  const result = compatibilityFixture({ version: "" }).run();
+  assert.deepEqual({ status: result.status, cliVersion: JSON.parse(result.stdout).cliVersion }, { status: 0, cliVersion: null });
+});
+
+test.each([
+  ["必須操作", (s) => { s.definitions.ClientRequest.oneOf = s.definitions.ClientRequest.oneOf.filter((m) => !m.properties.method.enum.includes("turn/interrupt")); }, /turn\/interrupt/],
+  ["続行入力", (s) => { delete s.definitions.v2.TurnStartParams.properties.toolOutput; }, /toolOutput/],
+  ["続行入力の型", (s) => { s.definitions.v2.TurnStartParams.properties.input = { type: "number" }; }, /turn\/start.input/],
+  ["応答", (s) => { delete s.definitions.v2.ThreadResumeResponse.properties.model; }, /ThreadResumeResponse.model/],
+  ["完了状態", (s) => { s.definitions.v2.TurnStartResponse.properties.turn.properties.status.enum = ["finished"]; }, /turn status/],
+  ["循環参照", (s) => { s.definitions.v2.TurnStartParams = { $ref: "#/definitions/v2/TurnStartParams" }; }, /cycle/],
+  ["通知", (s) => { s.definitions.ServerNotification.oneOf = []; }, /thread\/started/],
+  ["未知の必須入力", (s) => { s.definitions.v2.ThreadSettingsUpdateParams.required.push("newRequiredInput"); }, /newRequiredInput/],
+  ["任意入力の必須化", (s) => { s.definitions.v2.ThreadSettingsUpdateParams.required.push("collaborationMode"); }, /collaborationMode/],
+])("互換性検査は%sの欠落・変更を拒否する", (_label, mutate, reason) => {
+  const schema = structuredClone(protocol);
+  mutate(schema);
+  const { run } = compatibilityFixture({ schema });
+  const result = run();
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(JSON.parse(result.stdout).reason, reason);
+});
+
+test.each([
+  ["取得失敗", "process.exit(1);", /schema generation failed/],
+  ["時間切れ", 'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60_000);', /timed out/],
+  ["不正JSON", 'fs.writeFileSync(require("node:path").join(process.argv[process.argv.indexOf("--out") + 1], "codex_app_server_protocol.schemas.json"), "{"); process.exit(0);', /JSON/],
+])("互換性検査は%sで理由を返す", (_label, script, reason) => {
+  const result = compatibilityFixture({ script }).run();
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(JSON.parse(result.stdout).reason, reason);
+}, 15_000);
+
+test.each([["直接中継", ["app-server"], false], ["CLI", [], true], ["Desktop", ["app"], true]])("互換性のない%sはサーバー起動前に拒否する", (_label, args, launcher) => {
+  const { run, calls } = compatibilityFixture({ schema: {} });
+  const result = run(args, launcher);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr + result.stdout, /incompatible|schema|protocol/i);
+  assert.equal(readFileSync(calls, "utf8").trim().split("\n").map(JSON.parse).some((call) => call[0] === "app-server" && call[1] !== "generate-json-schema"), false);
+});
+
+// バージョン手動更新の撤去シナリオ（実装前の確認対象）:
+// - バージョン一覧の登録なしで、必要な通信仕様を持つCodexを利用できる。
+// - 未登録の新しい版でも必要な操作・項目が揃っていれば起動する。
+// - 必須機能の欠落、仕様取得の失敗・時間切れは理由を示して起動を拒否する。
+// - CLI・Desktop・直接中継の入口で同じ判定を使い、タスクや推論を作らず検査する。
+// - 本番とサンプルからsupportedCliVersionsを外し、既存の切り替え・タスク分離を維持する。
 
 // モデル設定構造の変更シナリオ（実装前の確認対象）:
 // - modelsのモデル別effortを読み、既定思考量と切り替え先一覧に反映する。
@@ -43,7 +139,7 @@ test.runIf(process.env.MODEL_ROUTER_LIVE === "1")("実機で同一タスクのSo
   const temporary = mkdtempSync("/private/tmp/model-router-live-");
   const innerCodexPath = process.env.MODEL_ROUTER_TEST_CODEX ?? "/Applications/ChatGPT.app/Contents/Resources/codex";
   const configPath = path.join(temporary, "config.json");
-  writeFileSync(configPath, JSON.stringify(makeConfig({ innerCodexPath, enabledRepositories: [temporary], supportedCliVersions: ["0.153.4"], maxBufferedBytes: 32 * 1024 * 1024,
+  writeFileSync(configPath, JSON.stringify(makeConfig({ innerCodexPath, enabledRepositories: [temporary], maxBufferedBytes: 32 * 1024 * 1024,
     models: { "gpt-5.6-sol": { effort: "high", summary: "auto", personality: "pragmatic" }, "gpt-6-astra": { effort: "high", summary: "concise", personality: "friendly" } },
   })));
   const child = spawn(process.execPath, [path.join(repositoryRoot, "src/proxy.mjs"), "app-server", "--listen", "stdio://"], {
@@ -136,7 +232,6 @@ function makeConfig(overrides = {}) {
     schemaVersion: 2,
     enabledRepositories: [repository],
     models: { "gpt-5.6-sol": { effort: "high" }, "gpt-6-astra": { effort: "high" } },
-    supportedCliVersions: ["0.153.1"],
     innerCodexPath: "/Applications/ChatGPT.app/Contents/Resources/codex",
     desktopAppPath: "/Applications/ChatGPT.app",
     maxBufferedBytes: 1024 * 1024,
@@ -541,6 +636,7 @@ test("中断受付後に完了通知が失われても待ち続けず失敗を�
   const temporary = mkdtempSync(path.join(tmpdir(), "model-router-timeout-"));
   const fakeCodex = path.join(temporary, "codex");
   writeFileSync(fakeCodex, `#!/usr/bin/env node
+${schemaCommand}
 if (process.argv[2] === "--version") { console.log("codex-cli 0.153.1"); process.exit(0); }
 const readline = require("node:readline");
 const send = (message) => console.log(JSON.stringify(message));
@@ -595,6 +691,7 @@ test("initialized通知がなくてもinitialize応答後にモデルカタロ�
   writeFileSync(
     fakeCodex,
     `#!/usr/bin/env node
+${schemaCommand}
 if (process.argv[2] === "--version") {
   process.stdout.write("codex-cli 0.153.1\\n");
   process.exit(0);
@@ -693,7 +790,7 @@ process.stdin.on("data", (chunk) => {
   assert.equal(response.result?.receivedModel, "gpt-6-astra", response.error?.message);
 });
 
-test("未対応CLIでは要求を透過中継する", () => {
+test("切り替えを無効化したエンジンは要求を書き換えない", () => {
   const { engine } = makeEngine(makeConfig(), { compatible: false });
   announceThread(engine, "thread-1");
   const request = turnRequest(80, "thread-1");
@@ -817,12 +914,10 @@ test("Desktop版をカレントディレクトリで起動する", () => {
   writeFileSync(fakePgrep, "#!/bin/sh\nexit 1\n");
   writeFileSync(
     fakeCodex,
-    `#!/bin/sh
-if [ "\${1:-}" = "--version" ]; then
-  printf 'codex-cli 0.153.1\\n'
-  exit 0
-fi
-printf '%s\\n' "$@" > "$CODEX_AUTO_CAPTURE_PATH"
+    `#!/usr/bin/env node
+${schemaCommand}
+if (process.argv[2] === "--version") { console.log("codex-cli 0.153.1"); process.exit(0); }
+require("node:fs").writeFileSync(process.env.CODEX_AUTO_CAPTURE_PATH, process.argv.slice(2).join("\\n"));
 `,
   );
   chmodSync(fakePgrep, 0o755);
@@ -855,22 +950,17 @@ test("サブコマンドなしでCLI版をカレントディレクトリのル�
   const configPath = path.join(temporary, "config.json");
   writeFileSync(
     fakeCodex,
-    `#!/bin/sh
-if [ "\${1:-}" = "--version" ]; then
-  printf 'codex-cli 0.153.4\\n'
-  exit 0
-fi
-if [ "\${1:-}" = "app-server" ]; then
-  while IFS= read -r line; do :; done
-  exit 0
-fi
-printf '%s\\n' "$@" > "$CODEX_AUTO_CAPTURE_PATH"
+    `#!/usr/bin/env node
+${schemaCommand}
+if (process.argv[2] === "--version") { console.log("codex-cli 0.153.4"); process.exit(0); }
+if (process.argv[2] === "app-server") { process.stdin.resume(); }
+else require("node:fs").writeFileSync(process.env.CODEX_AUTO_CAPTURE_PATH, process.argv.slice(2).join("\\n"));
 `,
   );
   chmodSync(fakeCodex, 0o755);
   writeFileSync(
     configPath,
-    JSON.stringify(makeConfig({ innerCodexPath: fakeCodex, supportedCliVersions: ["0.153.4"] })),
+    JSON.stringify(makeConfig({ innerCodexPath: fakeCodex })),
   );
 
   const result = spawnSync(path.join(repositoryRoot, "bin", "model-router"), ["--search"], {
@@ -897,7 +987,7 @@ test("設定ファイル内の行コメントを許可する", () => {
   const temporary = mkdtempSync(path.join(tmpdir(), "model-router-config-"));
   const fakeCodex = path.join(temporary, "codex");
   const configPath = path.join(temporary, "config.json");
-  writeFileSync(fakeCodex, '#!/bin/sh\nprintf \'codex-cli 0.153.1\\n\'\n');
+  writeFileSync(fakeCodex, `#!/usr/bin/env node\n${schemaCommand}\nconsole.log("codex-cli 0.153.1");\n`);
   chmodSync(fakeCodex, 0o755);
   const configWithComment = JSON.stringify(makeConfig(), null, 2).replace(
     '"enabledRepositories": [',
