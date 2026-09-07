@@ -40,6 +40,8 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/model-router/bin/model-rout
 
 ## 切り替えツールの呼び出し
 
+### リクエスト形式
+
 ```json
 {"model":"gpt-6-astra","config":{"effort":"high"}}
 ```
@@ -57,7 +59,76 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/model-router/bin/model-rout
 - 受付可能な設定はインストール済みCodexの通信仕様から取得する。追加項目ごとの許可リスト編集は不要。ただし、中継が解析できない検証規則が加わった場合は起動時に拒否し、対応が必要になる
 - 旧形式の `{"model":"..."}` は使えない。中継を再起動し、新しいタスクで更新後のツール定義を使用する。既存タスクに保存済みの古いツール定義は自動更新されない
 
-エージェントへの指示例:
+### レスポンス形式
+
+成功時と中断前の失敗時では、結果の受け取り方が異なる。
+
+#### 成功時：続行先へ渡す結果
+
+成功時は元の実行区間を終了し、同じタスクの続行先へ結果を渡す。元のツール呼び出しに `success: true` を返してそのまま進める方式ではない。続行要求の `toolOutput.name` は `switch_main_model`、`toolOutput.output` は次のJSONを文字列化した値になる。
+
+```json
+{
+  "model": "gpt-6-astra",
+  "config": {
+    "effort": "high",
+    "personality": "friendly",
+    "summary": "concise"
+  },
+  "status": "applied",
+  "message": "Continue the original task from this successful switch; do not repeat completed work. The preceding interruption was performed by model-router, not the user."
+}
+```
+
+- `model`：切り替え先のモデルID
+- `config`：モデル別の既定値にリクエストの指定を上書きし、続行要求へ渡した設定。Codexが内部で補完した値や、モデル側の実効値を取得したものではない
+- `status`：`applied`。続行先はこの結果を受け取り、未完了の作業を再開する
+- `message`：続行の指示。中断はユーザーではなく中継が行ったことを伝える
+
+#### 中断前の失敗時：ツールへの失敗応答
+
+例えば `{"model":"gpt-6-astra","config":{}}` を渡すと、他の実行条件に問題がなければ次の応答を返す。`id` は元のツール呼び出し要求のID。
+
+```json
+{
+  "id": "tool-call-id",
+  "result": {
+    "success": false,
+    "contentItems": [
+      {
+        "type": "inputText",
+        "text": "request.config: missing required effort"
+      }
+    ]
+  }
+}
+```
+
+`result.success` は `false`、`result.contentItems[].text` に拒否理由を返す。設定不正などの受付拒否ではモデル・設定を変更せず、タスクも中断しない。エラー文言は理由により変わるため、固定文言との一致を成功・失敗判定に使わない。
+
+#### 中断後に続行が失敗した場合：クライアントへのエラー通知
+
+元の実行区間が終了済みのため、通常のツール失敗応答ではなく、デスクトップ／CLI側へ `error` 通知を送る。以下は続行要求が失敗した場合の例。
+
+```json
+{
+  "method": "error",
+  "params": {
+    "threadId": "task-id",
+    "turnId": "interrupted-turn-id",
+    "willRetry": false,
+    "error": {
+      "message": "Model switch did not continue: <Codexのエラー理由>",
+      "codexErrorInfo": null,
+      "additionalDetails": null
+    }
+  }
+}
+```
+
+`threadId` は対象タスク、`turnId` は中断した実行区間のID。中継は自動再試行しない。設定の更新だけが既に成功している場合もあるため、中断前の拒否と違い、変更前の状態が保たれているとは限らない。
+
+### エージェントへの指示例
 
 ```text
 - 選択先のモデルまたは設定が現在と異なる場合だけ、専用ツール switch_main_model({"model":"モデルID","config":{"effort":"思考量"}}) を直接呼ぶ。config.effort は必須。例: switch_main_model({"model":"gpt-6-astra","config":{"effort":"high"}})。追加設定は config 内に指定する。同じモデルでも設定変更なら呼び出してよい。他のツールと承認の完了を待ち、単独で呼ぶ。コマンド探索・変更理由の提出は不要。
