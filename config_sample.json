@@ -13,9 +13,6 @@
       "effort": "high"
     }
   },
-  "supportedCliVersions": [
-    "0.153.4"
-  ],
   "innerCodexPath": "/Applications/ChatGPT.app/Contents/Resources/codex",
   "desktopAppPath": "/Applications/ChatGPT.app",
   "maxBufferedBytes": 33554432
