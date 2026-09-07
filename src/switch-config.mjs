@@ -109,7 +109,7 @@ function validate(value, schema, root, location, depth = 0) {
 }
 
 // インストール済みCodexの設定仕様から、ツール公開と受付検証で共用する契約を作る。
-export function createSwitchRequest(protocol, models) {
+export function createSwitchRequest(protocol) {
   let params = protocol.definitions?.ClientRequest?.oneOf?.find((entry) =>
     entry.properties?.method?.enum?.includes("turn/start"))?.properties?.params;
   const visited = new Set();
@@ -127,7 +127,7 @@ export function createSwitchRequest(protocol, models) {
   properties.effort = { allOf: [properties.effort, { type: "string", minLength: 1 }] };
   const inputSchema = {
     type: "object", properties: {
-      model: { type: "string", enum: Object.keys(models) },
+      model: { type: "string", minLength: 1 },
       config: { type: "object", properties, required: ["effort"], additionalProperties: false },
     }, required: ["model", "config"], additionalProperties: false,
     ...(Object.keys(definitions).length ? { definitions } : {}),
