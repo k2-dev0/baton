@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createSwitchRequest } from "./switch-config.mjs";
 
 const PROBE_TIMEOUT_MS = 5_000;
 const PROBE_MAX_BYTES = 1024 * 1024;
@@ -120,7 +121,7 @@ function checkProtocol(root) {
 }
 
 // 起動する実行ファイルから仕様を生成させる。推論・タスク作成・サーバー待受は行わない。
-export function checkCliCompatibility(innerCodexPath) {
+export function checkCliCompatibility(innerCodexPath, models) {
   const options = { encoding: "utf8", timeout: PROBE_TIMEOUT_MS, killSignal: "SIGKILL", maxBuffer: PROBE_MAX_BYTES,
     env: { ...process.env, CODEX_CLI_PATH: "" } };
   const version = spawnSync(innerCodexPath, ["--version"], options);
@@ -131,8 +132,10 @@ export function checkCliCompatibility(innerCodexPath) {
     const result = spawnSync(innerCodexPath, ["app-server", "generate-json-schema", "--experimental", "--out", temporary], options);
     if (result.error?.code === "ETIMEDOUT") throw new Error(`protocol schema generation timed out after ${PROBE_TIMEOUT_MS}ms`);
     if (result.error || result.status !== 0) throw new Error(`protocol schema generation failed: ${result.error?.message ?? `exit ${result.status}; ${result.stderr.trim()}`}`);
-    checkProtocol(JSON.parse(readFileSync(path.join(temporary, SCHEMA_FILENAME), "utf8")));
-    return { ok: true, cliVersion, reason: null };
+    const protocol = JSON.parse(readFileSync(path.join(temporary, SCHEMA_FILENAME), "utf8"));
+    checkProtocol(protocol);
+    const switchRequest = createSwitchRequest(protocol, models);
+    return { ok: true, cliVersion, reason: null, switchRequest };
   } catch (error) {
     return { ok: false, cliVersion, reason: error.message };
   } finally {
