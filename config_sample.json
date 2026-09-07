@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "enabledRepositories": [
     // モデル切り替えを行うプロジェクトを追加する
-    "/Users/kaikojima/Desktop/develop/model-router"
+    "/Users/[user_name]/model-router"
   ],
   "models": {
     // 切り替えで使用するモデルと設定を追加する
