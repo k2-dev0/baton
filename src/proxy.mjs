@@ -221,7 +221,7 @@ export class RouterEngine {
         forwarded.params.dynamicTools = [...existing, {
           type: "function", name: "switch_main_model",
           description: "Switch this main task to the specified model and automatically continue its unfinished work. Call alone, after awaiting other tools and approvals. This ends the current execution segment, not the task. No reason is required.",
-          inputSchema: { type: "object", properties: { model: { type: "string", enum: Object.keys(this.config.efforts) } }, required: ["model"], additionalProperties: false },
+          inputSchema: { type: "object", properties: { model: { type: "string", enum: Object.keys(this.config.models) } }, required: ["model"], additionalProperties: false },
         }];
       }
       if (hasRequestId(message)) this.pending.set(requestKey(message.id), {
@@ -315,7 +315,7 @@ export class RouterEngine {
     if (message.method === "item/tool/call") {
       const args = message.params.arguments;
       const valid = isObject(args) && Object.keys(args).length === 1 &&
-        typeof args.model === "string" && Object.hasOwn(this.config.efforts, args.model);
+        typeof args.model === "string" && Object.hasOwn(this.config.models, args.model);
       let error = valid ? null : "Specify only a configured model.";
       if (!this.compatible || thread?.isMain !== true ||
           !isRepositoryEnabled(thread?.cwd, this.config.enabledRepositories)) error = "This is not an enabled main task.";
@@ -328,7 +328,7 @@ export class RouterEngine {
       if (otherItems.length || [...this.serverRequests.values()].includes(threadId)) {
         error = "Await other tools and approvals before switching the model.";
       }
-      const effort = valid ? this.config.efforts[args.model] : null;
+      const effort = valid ? this.config.models[args.model].effort : null;
       if (!error) error = this.#availabilityError(args.model, effort)?.message ?? null;
       if (error || args.model === thread?.selectedModel) {
         action.upstream.push({ id: message.id, result: {

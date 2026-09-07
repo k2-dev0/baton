@@ -22,7 +22,7 @@ function normalizeRepository(repository) {
 export function validateConfig(input) {
   if (!isPlainObject(input)) throw new Error("config must be a JSON object");
   if (input.schemaVersion !== 2) throw new Error("config.schemaVersion must be 2; migrate using config_sample.json");
-  const removed = ["mode", "requestModelPolicy", "fixedModel", "threadPins", "escalatedThreads", "models", "rulesVersion"];
+  const removed = ["mode", "requestModelPolicy", "fixedModel", "threadPins", "escalatedThreads", "efforts", "rulesVersion"];
   if (removed.some((key) => Object.hasOwn(input, key))) {
     throw new Error("legacy model policy settings were removed; use config_sample.json");
   }
@@ -35,11 +35,12 @@ export function validateConfig(input) {
       throw new Error("enabledRepositories[] must contain absolute paths");
     }
   }
-  if (!isPlainObject(input.efforts)) throw new Error("config.efforts must be an object");
-  if (!Object.keys(input.efforts).length) throw new Error("config.efforts must contain at least one model");
-  for (const [model, effort] of Object.entries(input.efforts)) {
-    assertString(model, "config.efforts key");
-    assertString(effort, `config.efforts.${model}`);
+  if (!isPlainObject(input.models)) throw new Error("config.models must be an object");
+  if (!Object.keys(input.models).length) throw new Error("config.models must contain at least one model");
+  for (const [model, settings] of Object.entries(input.models)) {
+    assertString(model, "config.models key");
+    if (!isPlainObject(settings)) throw new Error(`config.models.${model} must be an object`);
+    assertString(settings.effort, `config.models.${model}.effort`);
   }
   assertString(input.innerCodexPath, "config.innerCodexPath");
   assertString(input.desktopAppPath, "config.desktopAppPath");
@@ -81,8 +82,8 @@ export function selectModel({ config, thread, requestParams }) {
   const settings = requestParams.collaborationMode?.settings;
   const model = settings?.model ?? requestParams.model ?? thread.selectedModel;
   const requestedEffort = settings?.reasoning_effort ?? requestParams.effort;
-  if (requestedEffort != null || !Object.hasOwn(config.efforts, model)) return base;
-  return { apply: true, model, effort: config.efforts[model], reasonCode: "default-effort" };
+  if (requestedEffort != null || !Object.hasOwn(config.models, model)) return base;
+  return { apply: true, model, effort: config.models[model].effort, reasonCode: "default-effort" };
 }
 
 // 選択済みのモデル設定だけを複製要求へ反映し、他のターン設定を保持する。

@@ -24,6 +24,12 @@ import { WebSocketFrameDecoder } from "../src/websocket.mjs";
 const repository = "/Users/test/project";
 const repositoryRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
+// モデル設定構造の変更シナリオ（実装前の確認対象）:
+// - modelsのモデル別effortを読み、既定思考量と切り替え先一覧に反映する。
+// - 空のモデル一覧、effortの欠落・不正値、旧efforts形式を明示的に拒否する。
+// - 本番・サンプルを新形式へ揃え、既存の切り替え・タスク間分離を維持する。
+// - 設定全体とモデル内の追加項目を保持し、未対応項目をCodexへ無条件送信しない。
+
 // 自律切り替えの修正シナリオ（実装前の確認対象）:
 // - メインタスクに変更ツールを追加し、既存ツールと指示を保持する。
 // - 理由なしの指定でSol→Astra→Solへ切り替え、同じタスクで追加入力なしに続行する。
@@ -123,7 +129,7 @@ function makeConfig(overrides = {}) {
   return validateConfig({
     schemaVersion: 2,
     enabledRepositories: [repository],
-    efforts: { "gpt-5.6-sol": "high", "gpt-6-astra": "high" },
+    models: { "gpt-5.6-sol": { effort: "high" }, "gpt-6-astra": { effort: "high" } },
     supportedCliVersions: ["0.153.1"],
     innerCodexPath: "/Applications/ChatGPT.app/Contents/Resources/codex",
     desktopAppPath: "/Applications/ChatGPT.app",
@@ -716,9 +722,40 @@ test("処理中の要求ID重複を拒否する", () => {
 });
 
 test("旧モード設定や不正なパスを明示的に拒否する", () => {
-  assert.throws(() => makeConfig({ efforts: {} }), /at least one model/);
+  assert.throws(() => makeConfig({ models: {} }), /at least one model/);
   assert.throws(() => makeConfig({ mode: "fixed" }), /removed/);
   assert.throws(() => makeConfig({ enabledRepositories: ["relative/repository"] }), /absolute paths/);
+});
+
+test("モデルごとの設定をオブジェクトとして受け取り、設定全体を保持する", () => {
+  const models = { "gpt-5.6-sol": { effort: "high", futureOption: { value: "keep" } } };
+  const config = makeConfig({ models, extraSetting: { enabled: true } });
+  assert.deepEqual({ models: config.models, extraSetting: config.extraSetting }, { models, extraSetting: { enabled: true } });
+});
+
+test("不正なモデル定義と旧形式を設定の読み込み時に拒否する", () => {
+  const cases = [
+    [{ efforts: { "gpt-5.6-sol": "high" } }, /removed/],
+    [{ models: null }, /config.models must be an object/],
+    [{ models: [] }, /config.models must be an object/],
+    [{ models: { default: "gpt-5.6-sol" } }, /must be an object/],
+    ...[null, [], "high"].map((settings) => [{ models: { "gpt-5.6-sol": settings } }, /must be an object/]),
+    ...[undefined, null, "", 1].map((effort) => [{ models: { "gpt-5.6-sol": { effort } } }, /effort must be a non-empty string/]),
+  ];
+  for (const [input, error] of cases) assert.throws(() => makeConfig(input), error);
+});
+
+test("モデル内の追加項目を保持しても他タスクの指定や未対応設定を送信しない", () => {
+  const config = makeConfig({ models: { "gpt-5.6-sol": { effort: "high" }, "gpt-6-astra": { effort: "high", threadId: "other", futureOption: true } } });
+  const { engine, call } = beginSwitchTest({ config });
+  const interrupt = switch_main_model(engine, call).upstream[0];
+  engine.processServerMessage({ id: interrupt.id, result: {} });
+  const settings = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } }).upstream[0];
+  const continuation = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
+  assert.deepEqual([settings, continuation].map((request) => ({ threadId: request.params.threadId, model: request.params.model, effort: request.params.effort, futureOption: request.params.futureOption })), [
+    { threadId: "main", model: "gpt-6-astra", effort: "high", futureOption: undefined },
+    { threadId: "main", model: "gpt-6-astra", effort: "high", futureOption: undefined },
+  ]);
 });
 
 test("Desktopプロセスを検出できない環境では起動しない", () => {
