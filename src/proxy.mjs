@@ -13,7 +13,7 @@ import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { applySelection, isRepositoryEnabled, selectModel, validateConfig } from "./policy.mjs";
+import { applySelection, isRepositoryEnabled, validateConfig } from "./policy.mjs";
 import { createUnixWebSocketLineServer } from "./websocket.mjs";
 import { checkCliCompatibility } from "./compatibility.mjs";
 
@@ -222,7 +222,7 @@ export class RouterEngine {
         forwarded.params ??= {};
         forwarded.params.dynamicTools = [...existing, {
           type: "function", name: "switch_main_model",
-          description: "Switch this main task's model or settings and automatically continue its unfinished work. Always provide config.effort explicitly. Other config fields override the model defaults. The same model is allowed when changing settings. Call alone, after awaiting other tools and approvals. This ends the current execution segment, not the task. No reason is required.",
+          description: "Switch this main task's model or settings and automatically continue its unfinished work. Always provide config.effort explicitly. Only the supplied config fields are applied; omitted settings follow Codex defaults and inheritance. The model and effort must be available in Codex. The same model is allowed when changing settings. Call alone, after awaiting other tools and approvals. This ends the current execution segment, not the task. No reason is required.",
           inputSchema: this.switchRequest.inputSchema,
         }];
       }
@@ -236,19 +236,11 @@ export class RouterEngine {
     }
     const thread = this.threads[threadId];
     const isNewTurn = Boolean(thread && !thread.activeTurnId && !thread.pendingTurnRequestId);
-    const selection = isNewTurn && this.compatible
-      ? selectModel({ config: this.config, thread, requestParams: message.params })
-      : { apply: false, model: null, effort: null, reasonCode: "preserve" };
-    if (selection.apply) {
-      const error = this.#availabilityError(selection.model, selection.effort);
-      if (error) return { type: "local-error", message: this.#localError(message.id, error.message) };
-    }
-    const forwarded = selection.apply ? applySelection(message, selection) : message;
     if (isNewTurn) thread.pendingTurnRequestId = requestKey(message.id);
     this.pending.set(requestKey(message.id), {
-      kind: "turn-start", threadId, isNewTurn, selection, params: cloneJson(forwarded.params),
+      kind: "turn-start", threadId, isNewTurn, params: cloneJson(message.params),
     });
-    return { type: "forward", message: forwarded, modified: forwarded !== message };
+    return { type: "forward", message, modified: false };
   }
 
   processServerMessage(message) {
@@ -337,7 +329,7 @@ export class RouterEngine {
         return action;
       }
       state = { call: cloneJson(message), threadId, turnId: message.params.turnId,
-        model: args.model, effort, settings: { ...cloneJson(this.config.models[args.model]), ...cloneJson(args.config) },
+        model: args.model, effort, settings: cloneJson(args.config),
         phase: "inspect", interrupted: false, interruptAccepted: false, cancelled: false };
       this.switches.set(threadId, state);
     } else if (!state) {
@@ -509,7 +501,7 @@ export class RouterEngine {
     if (response.error) {
       this.diagnostics.record("turn-not-accepted", {
         threadId: pending.threadId,
-        reasonCode: pending.selection.reasonCode,
+        reasonCode: "preserve",
       });
       this.#save();
       return;
@@ -613,7 +605,7 @@ export function runAppServerProxy({
 }) {
   const diagnostics = new Diagnostics(stateDirectory);
   const stateStore = new MemoryStateStore();
-  const { switchRequest, ...compatibility } = checkCliCompatibility(innerCodexPath, config.models);
+  const { switchRequest, ...compatibility } = checkCliCompatibility(innerCodexPath);
   diagnostics.record("proxy-start", { ...compatibility, compatible: compatibility.ok });
   if (!compatibility.ok) throw new Error(`incompatible Codex: ${compatibility.reason}`);
   const engine = new RouterEngine({ config, diagnostics, stateStore, switchRequest });
@@ -897,7 +889,7 @@ export function runCliWebSocketProxy({ config, innerCodexPath, listenUrl, stateD
 
 // 起動前診断に必要な互換性情報だけを標準出力へ返す。
 function printCheck(config, innerCodexPath) {
-  const { switchRequest, ...compatibility } = checkCliCompatibility(innerCodexPath, config.models);
+  const { switchRequest, ...compatibility } = checkCliCompatibility(innerCodexPath);
   const result = {
     ...compatibility,
     innerCodexPath,
