@@ -46,7 +46,7 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/model-router/bin/model-rout
 {"model":"gpt-6-astra","config":{"effort":"high"}}
 ```
 
-`switch_main_model` に上記のオブジェクトを渡す。`config` はファイル名ではなく、その呼び出しで適用する設定。追加設定も同じオブジェクトに指定できる。
+`switch_model` に上記のオブジェクトを渡す。`config` はファイル名ではなく、その呼び出しで適用する設定。追加設定も同じオブジェクトに指定できる。
 
 ```json
 {"model":"gpt-6-astra","config":{"effort":"high","personality":"friendly","summary":"concise"}}
@@ -64,7 +64,7 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/model-router/bin/model-rout
 
 #### 成功時：続行先へ渡す結果
 
-成功時は元の実行区間を終了し、同じタスクの続行先へ結果を渡す。元のツール呼び出しに `success: true` を返してそのまま進める方式ではない。続行要求の `toolOutput.name` は `switch_main_model`、`toolOutput.output` は次のJSONを文字列化した値になる。
+成功時は元の実行区間を終了し、同じタスクの続行先へ結果を渡す。元のツール呼び出しに `success: true` を返してそのまま進める方式ではない。続行要求の `toolOutput.name` は `switch_model`、`toolOutput.output` は次のJSONを文字列化した値になる。
 
 ```json
 {
@@ -130,7 +130,7 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/model-router/bin/model-rout
 ### エージェントへの指示例
 
 ```text
-- 選択先のモデルまたは設定が現在と異なる場合だけ、専用ツール switch_main_model({"model":"モデルID","config":{"effort":"思考量"}}) を直接呼ぶ。config.effort は必須。例: switch_main_model({"model":"gpt-6-astra","config":{"effort":"high"}})。追加設定は config 内に指定する。同じモデルでも設定変更なら呼び出してよい。他のツールと承認の完了を待ち、単独で呼ぶ。コマンド探索・変更理由の提出は不要。
+- 選択先のモデルまたは設定が現在と異なる場合だけ、専用ツール switch_model({"model":"モデルID","config":{"effort":"思考量"}}) を直接呼ぶ。config.effort は必須。例: switch_model({"model":"gpt-6-astra","config":{"effort":"high"}})。追加設定は config 内に指定する。同じモデルでも設定変更なら呼び出してよい。他のツールと承認の完了を待ち、単独で呼ぶ。コマンド探索・変更理由の提出は不要。
 ```
 
 ## 記録と検証

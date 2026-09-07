@@ -215,13 +215,13 @@ export class RouterEngine {
       if (message.method === "thread/start" && this.compatible &&
           isRepositoryEnabled(message.params?.cwd ?? process.cwd(), this.config.enabledRepositories)) {
         const existing = message.params?.dynamicTools ?? [];
-        if (!Array.isArray(existing) || existing.some((tool) => tool.name === "switch_main_model")) {
-          return { type: "local-error", message: this.#localError(message.id, "switch_main_model conflicts with an existing tool") };
+        if (!Array.isArray(existing) || existing.some((tool) => tool.name === "switch_model")) {
+          return { type: "local-error", message: this.#localError(message.id, "switch_model conflicts with an existing tool") };
         }
         forwarded = cloneJson(message);
         forwarded.params ??= {};
         forwarded.params.dynamicTools = [...existing, {
-          type: "function", name: "switch_main_model",
+          type: "function", name: "switch_model",
           description: "Switch this main task's model or settings and automatically continue its unfinished work. Always provide config.effort explicitly. Only the supplied config fields are applied; omitted settings follow Codex defaults and inheritance. The model and effort must be available in Codex. The same model is allowed when changing settings. Call alone, after awaiting other tools and approvals. This ends the current execution segment, not the task. No reason is required.",
           inputSchema: this.switchRequest.inputSchema,
         }];
@@ -245,14 +245,14 @@ export class RouterEngine {
 
   processServerMessage(message) {
     if (!isObject(message)) return;
-    if (message.method === "item/tool/call" && message.params?.tool === "switch_main_model" && message.params?.namespace == null) {
-      return this.switch_main_model(message);
+    if (message.method === "item/tool/call" && message.params?.tool === "switch_model" && message.params?.namespace == null) {
+      return this.switch_model(message);
     }
     if (isRequest(message)) this.serverRequests.set(requestKey(message.id), message.params?.threadId);
     if (hasRequestId(message) && !message.method) {
       const key = requestKey(message.id);
       const pending = this.pending.get(key);
-      if (pending?.kind === "switch") return this.switch_main_model(message);
+      if (pending?.kind === "switch") return this.switch_model(message);
       if (typeof message.id === "string" && message.id.startsWith("model-router:switch:")) {
         return { consume: true, upstream: [], downstream: [] };
       }
@@ -296,11 +296,11 @@ export class RouterEngine {
       thread.activeItems = {};
     }
     this.#save();
-    if (message.method === "turn/completed" && this.switches.has(threadId)) return this.switch_main_model(message);
+    if (message.method === "turn/completed" && this.switches.has(threadId)) return this.switch_model(message);
   }
 
   // 切り替えツールの待機を区切りにし、Codexの正規手順で同じタスクを続行する。
-  switch_main_model(message) {
+  switch_model(message) {
     const action = { consume: message.method !== "turn/completed", upstream: [], downstream: [] };
     const pending = !message.method ? this.pending.get(requestKey(message.id)) : null;
     const threadId = pending?.threadId ?? message.params?.threadId;
@@ -436,7 +436,7 @@ export class RouterEngine {
       delete params.clientUserMessageId;
       params.input = [];
       params.turnTrigger = "model-router";
-      params.toolOutput = { name: "switch_main_model", output: JSON.stringify({
+      params.toolOutput = { name: "switch_model", output: JSON.stringify({
         model: state.model, config: state.settings, status: "applied",
         message: "Continue the original task from this successful switch; do not repeat completed work. The preceding interruption was performed by model-router, not the user.",
       }) };
