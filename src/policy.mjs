@@ -44,16 +44,6 @@ export function validateConfig(input) {
       throw new Error("enabledRepositories[] must contain absolute paths");
     }
   }
-  if (!isPlainObject(input.models)) throw new Error("config.models must be an object");
-  if (!Object.keys(input.models).length) throw new Error("config.models must contain at least one model");
-  for (const [model, settings] of Object.entries(input.models)) {
-    assertString(model, "config.models key");
-    if (!isPlainObject(settings)) throw new Error(`config.models.${model} must be an object`);
-    if (Object.keys(settings).some(isReservedModelSetting)) {
-      throw new Error(`config.models.${model} contains reserved task, input, or permission settings`);
-    }
-    assertString(settings.effort, `config.models.${model}.effort`);
-  }
   assertString(input.innerCodexPath, "config.innerCodexPath");
   assertString(input.desktopAppPath, "config.desktopAppPath");
   if (!path.isAbsolute(input.innerCodexPath) || !path.isAbsolute(input.desktopAppPath)) {
@@ -64,8 +54,9 @@ export function validateConfig(input) {
     throw new Error("config.maxBufferedBytes must be an integer of at least 1024");
   }
 
+  const { models: unusedModels, ...startupConfig } = input;
   return {
-    ...input,
+    ...startupConfig,
     enabledRepositories: input.enabledRepositories.map(normalizeRepository),
   };
 }
@@ -78,21 +69,6 @@ export function isRepositoryEnabled(cwd, enabledRepositories) {
     const relative = path.relative(repository, normalized);
     return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
   });
-}
-
-// 選択判断はエージェントに任せ、モデル別設定を利用者の未指定項目へ補う。
-export function selectModel({ config, thread, requestParams }) {
-  const base = { apply: false, model: null, effort: null, reasonCode: "preserve" };
-  if (thread?.isMain !== true) return base;
-  if (!isRepositoryEnabled(requestParams.cwd ?? thread.cwd, config.enabledRepositories)) return base;
-  const settings = requestParams.collaborationMode?.settings;
-  const model = settings?.model ?? requestParams.model ?? thread.selectedModel;
-  const requestedEffort = settings?.reasoning_effort ?? requestParams.effort;
-  if (!Object.hasOwn(config.models, model)) return base;
-  const defaults = Object.fromEntries(Object.entries(config.models[model]).filter(([key]) => key !== "effort" && requestParams[key] === undefined));
-  if (requestedEffort == null) defaults.effort = config.models[model].effort;
-  if (!Object.keys(defaults).length) return base;
-  return { apply: true, model, effort: requestedEffort ?? config.models[model].effort, settings: defaults, reasonCode: "model-defaults" };
 }
 
 // 選択モデルの設定一式を複製要求へ反映し、既存の作業モードと整合させる。
