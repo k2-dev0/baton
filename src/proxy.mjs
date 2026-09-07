@@ -337,7 +337,8 @@ export class RouterEngine {
         return action;
       }
       state = { call: cloneJson(message), threadId, turnId: message.params.turnId,
-        model: args.model, effort, phase: "inspect", interrupted: false, interruptAccepted: false, cancelled: false };
+        model: args.model, effort, settings: cloneJson(this.config.models[args.model]),
+        phase: "inspect", interrupted: false, interruptAccepted: false, cancelled: false };
       this.switches.set(threadId, state);
     } else if (!state) {
       if (pending) this.pending.delete(requestKey(message.id));
@@ -431,12 +432,13 @@ export class RouterEngine {
       }
     } else if (state.phase === "continue") {
       method = "turn/start";
-      params = applySelection({ params: thread.turnParams }, state).params;
+      params = cloneJson(thread.turnParams);
       // Sticky設定はCodexの最新値を継承し、古い権限・環境を再適用しない。
       for (const key of ["cwd", "runtimeWorkspaceRoots", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "permissions", "environments", "serviceTier", "summary", "personality", "multiAgentMode"]) delete params[key];
       for (const key of ["approvalsReviewer", "summary", "serviceTier"]) {
         if (Object.hasOwn(thread.liveSettings ?? {}, key)) params[key] = thread.liveSettings[key];
       }
+      params = applySelection({ params }, state).params;
       delete params.clientUserMessageId;
       params.input = [];
       params.turnTrigger = "model-router";
