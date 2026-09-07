@@ -121,7 +121,7 @@ function checkProtocol(root) {
 }
 
 // 起動する実行ファイルから仕様を生成させる。推論・タスク作成・サーバー待受は行わない。
-export function checkCliCompatibility(innerCodexPath, models) {
+export function checkCliCompatibility(innerCodexPath) {
   const options = { encoding: "utf8", timeout: PROBE_TIMEOUT_MS, killSignal: "SIGKILL", maxBuffer: PROBE_MAX_BYTES,
     env: { ...process.env, CODEX_CLI_PATH: "" } };
   const version = spawnSync(innerCodexPath, ["--version"], options);
@@ -134,7 +134,7 @@ export function checkCliCompatibility(innerCodexPath, models) {
     if (result.error || result.status !== 0) throw new Error(`protocol schema generation failed: ${result.error?.message ?? `exit ${result.status}; ${result.stderr.trim()}`}`);
     const protocol = JSON.parse(readFileSync(path.join(temporary, SCHEMA_FILENAME), "utf8"));
     checkProtocol(protocol);
-    const switchRequest = createSwitchRequest(protocol, models);
+    const switchRequest = createSwitchRequest(protocol);
     return { ok: true, cliVersion, reason: null, switchRequest };
   } catch (error) {
     return { ok: false, cliVersion, reason: error.message };
