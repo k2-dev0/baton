@@ -146,8 +146,9 @@ export class MemoryDiagnostics {
 }
 
 export class RouterEngine {
-  constructor({ config, diagnostics, stateStore, compatible = true }) {
+  constructor({ config, diagnostics, stateStore, switchRequest, compatible = true }) {
     this.config = config;
+    this.switchRequest = switchRequest;
     this.diagnostics = diagnostics;
     this.stateStore = stateStore;
     this.compatible = compatible;
@@ -221,8 +222,8 @@ export class RouterEngine {
         forwarded.params ??= {};
         forwarded.params.dynamicTools = [...existing, {
           type: "function", name: "switch_main_model",
-          description: "Switch this main task to the specified model and automatically continue its unfinished work. Call alone, after awaiting other tools and approvals. This ends the current execution segment, not the task. No reason is required.",
-          inputSchema: { type: "object", properties: { model: { type: "string", enum: Object.keys(this.config.models) } }, required: ["model"], additionalProperties: false },
+          description: "Switch this main task's model or settings and automatically continue its unfinished work. Always provide config.effort explicitly. Other config fields override the model defaults. The same model is allowed when changing settings. Call alone, after awaiting other tools and approvals. This ends the current execution segment, not the task. No reason is required.",
+          inputSchema: this.switchRequest.inputSchema,
         }];
       }
       if (hasRequestId(message)) this.pending.set(requestKey(message.id), {
@@ -315,9 +316,7 @@ export class RouterEngine {
     let state = this.switches.get(threadId);
     if (message.method === "item/tool/call") {
       const args = message.params.arguments;
-      const valid = isObject(args) && Object.keys(args).length === 1 &&
-        typeof args.model === "string" && Object.hasOwn(this.config.models, args.model);
-      let error = valid ? null : "Specify only a configured model.";
+      let error = this.switchRequest.validateRequest(args);
       if (!this.compatible || thread?.isMain !== true ||
           !isRepositoryEnabled(thread?.cwd, this.config.enabledRepositories)) error = "This is not an enabled main task.";
       if (!thread?.turnParams || thread.activeTurnId !== message.params.turnId) error = "The calling turn is no longer active.";
@@ -329,16 +328,16 @@ export class RouterEngine {
       if (otherItems.length || [...this.serverRequests.values()].includes(threadId)) {
         error = "Await other tools and approvals before switching the model.";
       }
-      const effort = valid ? this.config.models[args.model].effort : null;
+      const effort = args?.config?.effort;
       if (!error) error = this.#availabilityError(args.model, effort)?.message ?? null;
-      if (error || args.model === thread?.selectedModel) {
+      if (error) {
         action.upstream.push({ id: message.id, result: {
-          success: !error, contentItems: [{ type: "inputText", text: error ?? "The requested model is already active." }],
+          success: false, contentItems: [{ type: "inputText", text: error }],
         } });
         return action;
       }
       state = { call: cloneJson(message), threadId, turnId: message.params.turnId,
-        model: args.model, effort, settings: cloneJson(this.config.models[args.model]),
+        model: args.model, effort, settings: { ...cloneJson(this.config.models[args.model]), ...cloneJson(args.config) },
         phase: "inspect", interrupted: false, interruptAccepted: false, cancelled: false };
       this.switches.set(threadId, state);
     } else if (!state) {
@@ -412,6 +411,7 @@ export class RouterEngine {
         thread.activeTurnId = turn.id;
         thread.selectedModel = state.model;
         thread.selectedEffort = state.effort;
+        thread.turnParams = cloneJson(pending.params);
         this.diagnostics.record("switch-accepted", { threadId, turnId: turn.id, model: state.model, effort: state.effort });
         this.#save();
         return action;
@@ -445,11 +445,11 @@ export class RouterEngine {
       params.input = [];
       params.turnTrigger = "model-router";
       params.toolOutput = { name: "switch_main_model", output: JSON.stringify({
-        model: state.model, status: "applied",
+        model: state.model, config: state.settings, status: "applied",
         message: "Continue the original task from this successful switch; do not repeat completed work. The preceding interruption was performed by model-router, not the user.",
       }) };
     }
-    this.pending.set(requestKey(id), { kind: "switch", threadId });
+    this.pending.set(requestKey(id), { kind: "switch", threadId, params: cloneJson(params) });
     action.upstream.push({ id, method, params });
     return action;
   }
@@ -613,10 +613,10 @@ export function runAppServerProxy({
 }) {
   const diagnostics = new Diagnostics(stateDirectory);
   const stateStore = new MemoryStateStore();
-  const compatibility = checkCliCompatibility(innerCodexPath);
+  const { switchRequest, ...compatibility } = checkCliCompatibility(innerCodexPath, config.models);
   diagnostics.record("proxy-start", { ...compatibility, compatible: compatibility.ok });
   if (!compatibility.ok) throw new Error(`incompatible Codex: ${compatibility.reason}`);
-  const engine = new RouterEngine({ config, diagnostics, stateStore });
+  const engine = new RouterEngine({ config, diagnostics, stateStore, switchRequest });
 
   const child = spawn(innerCodexPath, args, {
     env: { ...process.env, CODEX_CLI_PATH: "" },
@@ -897,8 +897,9 @@ export function runCliWebSocketProxy({ config, innerCodexPath, listenUrl, stateD
 
 // 起動前診断に必要な互換性情報だけを標準出力へ返す。
 function printCheck(config, innerCodexPath) {
+  const { switchRequest, ...compatibility } = checkCliCompatibility(innerCodexPath, config.models);
   const result = {
-    ...checkCliCompatibility(innerCodexPath),
+    ...compatibility,
     innerCodexPath,
     enabledRepositories: config.enabledRepositories,
   };
