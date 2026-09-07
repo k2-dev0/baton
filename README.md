@@ -22,7 +22,7 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/model-router/bin/model-rout
 /Users/[user_name]/model-router/bin/model-router app
 ```
 
-## 設定と移行
+## 設定
 
 - `config.json` は本番用・Git管理対象外です。`config_sample.json` はひな形
 - 対象ディレクトリの path を `enabledRepositories` に絶対パスで登録する
@@ -34,7 +34,6 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/model-router/bin/model-rout
 - Codexが設定を受け付けても、モデル側でそのまま使われる保証とは異なる。0.153.4の実機では `summary: "concise"` の受付通知を確認した一方、実行記録は `summary: "auto"` だった。中継は値を書き換えず送信する
 - 設定ファイルの編集は、中継の次回起動時に読み込まれる
 - 配布元のモデル選択基準は AI に指示、もしくは設定する
-- `supportedCliVersions` の登録・更新は不要。旧設定に残っていても互換性判定には使わない
 - 起動するCodex自身から実験的機能を含む通信仕様を生成し、中継に必要な操作・項目・基本的な型・実行状態を確認する。仕様生成の失敗・5秒の時間切れ・必須機能の欠落は理由を表示して起動を拒否する。検査ではタスクを作らず、推論も行わない
 - この検査は中継が使う通信契約の確認であり、将来のCodexの動作すべてを保証するものではない。通信方式自体が変わった場合は中継側の対応が必要
 
@@ -57,7 +56,6 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/model-router/bin/model-rout
 - `effort` 以外の省略項目にはモデル別の既定値を使う。オブジェクト値は項目ごとの置換であり、再帰的なマージはしない
 - モデルが同じでも設定変更を受け付け、同じタスクで続行する。他のタスクや `config.json` は変更しない
 - 受付可能な設定はインストール済みCodexの通信仕様から取得する。追加項目ごとの許可リスト編集は不要。ただし、中継が解析できない検証規則が加わった場合は起動時に拒否し、対応が必要になる
-- 旧形式の `{"model":"..."}` は使えない。中継を再起動し、新しいタスクで更新後のツール定義を使用する。既存タスクに保存済みの古いツール定義は自動更新されない
 
 ### レスポンス形式
 
