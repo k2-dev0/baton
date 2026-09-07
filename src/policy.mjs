@@ -53,12 +53,6 @@ export function validateConfig(input) {
   if (!path.isAbsolute(input.innerCodexPath) || !path.isAbsolute(input.desktopAppPath)) {
     throw new Error("innerCodexPath and desktopAppPath must be absolute paths");
   }
-  if (
-    !Array.isArray(input.supportedCliVersions) ||
-    input.supportedCliVersions.some((version) => typeof version !== "string" || version.length === 0)
-  ) {
-    throw new Error("config.supportedCliVersions must be a string array");
-  }
   const minimumProtocolBytes = 1024;
   if (!Number.isSafeInteger(input.maxBufferedBytes) || input.maxBufferedBytes < minimumProtocolBytes) {
     throw new Error("config.maxBufferedBytes must be an integer of at least 1024");
