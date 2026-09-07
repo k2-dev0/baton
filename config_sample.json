@@ -4,15 +4,6 @@
     // モデル切り替えを行うプロジェクトを追加する
     "/Users/[user_name]/model-router"
   ],
-  "models": {
-    // 切り替えで使用するモデルと設定を追加する
-    "gpt-5.6-sol": {
-      "effort": "high"
-    },
-    "gpt-6-astra": {
-      "effort": "high"
-    }
-  },
   "innerCodexPath": "/Applications/ChatGPT.app/Contents/Resources/codex",
   "desktopAppPath": "/Applications/ChatGPT.app",
   "maxBufferedBytes": 33554432
