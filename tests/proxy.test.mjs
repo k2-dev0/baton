@@ -28,7 +28,7 @@ const repositoryRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url))
 // - modelsのモデル別effortを読み、既定思考量と切り替え先一覧に反映する。
 // - 空のモデル一覧、effortの欠落・不正値、旧efforts形式を明示的に拒否する。
 // - 本番・サンプルを新形式へ揃え、既存の切り替え・タスク間分離を維持する。
-// - 設定全体とモデル内の追加項目を保持し、未対応項目をCodexへ無条件送信しない。
+// - 選択モデルの追加設定を実行開始要求へまとめて渡し、タスク・入力・権限の上書きは拒否する。
 
 // 自律切り替えの修正シナリオ（実装前の確認対象）:
 // - メインタスクに変更ツールを追加し、既存ツールと指示を保持する。
@@ -43,13 +43,16 @@ test.runIf(process.env.MODEL_ROUTER_LIVE === "1")("実機で同一タスクのSo
   const temporary = mkdtempSync("/private/tmp/model-router-live-");
   const innerCodexPath = process.env.MODEL_ROUTER_TEST_CODEX ?? "/Applications/ChatGPT.app/Contents/Resources/codex";
   const configPath = path.join(temporary, "config.json");
-  writeFileSync(configPath, JSON.stringify(makeConfig({ innerCodexPath, enabledRepositories: [temporary], supportedCliVersions: ["0.153.4"], maxBufferedBytes: 32 * 1024 * 1024 })));
+  writeFileSync(configPath, JSON.stringify(makeConfig({ innerCodexPath, enabledRepositories: [temporary], supportedCliVersions: ["0.153.4"], maxBufferedBytes: 32 * 1024 * 1024,
+    models: { "gpt-5.6-sol": { effort: "high", summary: "auto", personality: "pragmatic" }, "gpt-6-astra": { effort: "high", summary: "concise", personality: "friendly" } },
+  })));
   const child = spawn(process.execPath, [path.join(repositoryRoot, "src/proxy.mjs"), "app-server", "--listen", "stdio://"], {
     cwd: temporary, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, CODEX_CLI_PATH: "", CODEX_MODEL_ROUTER_CONFIG: configPath, CODEX_MODEL_ROUTER_STATE_DIR: path.join(temporary, "router") },
   });
   const pending = new Map();
   const events = [];
   const switches = [];
+  let lastModel = "gpt-5.6-sol";
   let sequence = 0;
   let stderr = "";
   let testThread = null;
@@ -72,7 +75,8 @@ test.runIf(process.env.MODEL_ROUTER_LIVE === "1")("実機で同一タスクのSo
       if (message.error) request.reject(new Error(JSON.stringify(message.error)));
       else request.resolve(message.result);
     }
-    if (message.method === "thread/settings/updated") {
+    if (message.method === "thread/settings/updated" && message.params.threadSettings.model !== lastModel) {
+      lastModel = message.params.threadSettings.model;
       switches.push({ threadId: message.params.threadId, model: message.params.threadSettings.model });
     }
     if (message.method === "turn/completed" && message.params.turn.status !== "interrupted") {
@@ -107,6 +111,8 @@ test.runIf(process.env.MODEL_ROUTER_LIVE === "1")("実機で同一タスクのSo
       writeFileSync(path.join(temporary, "rollout.jsonl"), rollout, { mode: 0o600 });
       const contexts = rollout.trim().split("\n").map(JSON.parse).filter((entry) => entry.type === "turn_context");
       assert.deepEqual(contexts.map((entry) => [entry.payload.model, entry.payload.effort]), [["gpt-5.6-sol", "high"], ["gpt-6-astra", "high"], ["gpt-5.6-sol", "high"]]);
+      assert.deepEqual(contexts.map((entry) => entry.payload.personality), ["pragmatic", "friendly", "pragmatic"]);
+      assert.ok(events.some((entry) => entry.method === "thread/settings/updated" && entry.params.threadSettings.model === "gpt-6-astra" && entry.params.threadSettings.summary === "concise"), "Codex acknowledged the additional summary setting; effective reasoning summaries remain model-dependent");
       const responseTurns = events.filter((entry) => entry.method === "rawResponse/completed" ||
         (entry.method === "rawResponseItem/completed" && ["custom_tool_call", "function_call"].includes(entry.params.item.type))).map((entry) => entry.params.turnId);
       assert.ok(contexts.every((entry) => responseTurns.includes(entry.payload.turn_id)), "each actual model context produced an upstream response");
@@ -264,7 +270,7 @@ test("自由文を分類せず、指定モデルの未指定effortだけを補�
     config: makeConfig(), thread: { id: "main", cwd: repository, isMain: true, selectedModel: "gpt-5.6-sol" },
     requestParams: { model: "gpt-5.6-sol", input: [{ type: "text", text: "課金と権限と並行保存" }] },
   });
-  assert.deepEqual(decision, { apply: true, model: "gpt-5.6-sol", effort: "high", reasonCode: "default-effort" });
+  assert.deepEqual(decision, { apply: true, model: "gpt-5.6-sol", effort: "high", settings: { effort: "high" }, reasonCode: "model-defaults" });
 });
 
 test("利用者のモデルとeffort、子と対象外のタスクを保持する", () => {
@@ -745,17 +751,36 @@ test("不正なモデル定義と旧形式を設定の読み込み時に拒否�
   for (const [input, error] of cases) assert.throws(() => makeConfig(input), error);
 });
 
-test("モデル内の追加項目を保持しても他タスクの指定や未対応設定を送信しない", () => {
-  const config = makeConfig({ models: { "gpt-5.6-sol": { effort: "high" }, "gpt-6-astra": { effort: "high", threadId: "other", futureOption: true } } });
+test("選択モデルの追加項目を型変換せずCodexの続行要求へまとめて渡す", () => {
+  const extra = { summary: "concise", personality: "friendly", serviceTier: null, futureOption: { enabled: true, count: 0, list: ["value"] } };
+  const config = makeConfig({ models: { "gpt-5.6-sol": { effort: "high" }, "gpt-6-astra": { effort: "high", ...extra } } });
   const { engine, call } = beginSwitchTest({ config });
+  const before = structuredClone(config);
   const interrupt = switch_main_model(engine, call).upstream[0];
   engine.processServerMessage({ id: interrupt.id, result: {} });
   const settings = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } }).upstream[0];
   const continuation = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
-  assert.deepEqual([settings, continuation].map((request) => ({ threadId: request.params.threadId, model: request.params.model, effort: request.params.effort, futureOption: request.params.futureOption })), [
-    { threadId: "main", model: "gpt-6-astra", effort: "high", futureOption: undefined },
-    { threadId: "main", model: "gpt-6-astra", effort: "high", futureOption: undefined },
-  ]);
+  assert.deepEqual({
+    extra: Object.fromEntries(Object.keys(extra).map((key) => [key, continuation.params[key]])),
+    threadId: continuation.params.threadId, model: continuation.params.model, input: continuation.params.input,
+    configUnchanged: JSON.stringify(config) === JSON.stringify(before),
+  }, { extra, threadId: "main", model: "gpt-6-astra", input: [], configUnchanged: true });
+});
+
+test("追加設定は通常の開始にも既定値として渡し、利用者の指定を優先する", () => {
+  const config = makeConfig({ models: { "gpt-5.6-sol": { effort: "high", summary: "concise", serviceTier: "default", futureOption: false } } });
+  const { engine } = makeEngine(config);
+  announceThread(engine, "main", { model: "gpt-5.6-sol" });
+  const { params } = engine.processClientMessage(turnRequest("start", "main", { effort: "xhigh", serviceTier: null })).message;
+  assert.deepEqual({ model: params.model, effort: params.effort, summary: params.summary, serviceTier: params.serviceTier, futureOption: params.futureOption },
+    { model: "gpt-5.6-sol", effort: "xhigh", summary: "concise", serviceTier: null, futureOption: false });
+});
+
+test("モデル設定からタスク・会話・権限・作業指示を上書きできない", () => {
+  const reserved = ["model", "threadId", "turnId", "input", "toolOutput", "turnTrigger", "clientUserMessageId", "cwd", "runtimeWorkspaceRoots", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "permissions", "environments", "collaborationMode", "additionalContext", "multiAgentMode", "cyberAccessProgram"];
+  for (const key of reserved) {
+    assert.throws(() => makeConfig({ models: { "gpt-5.6-sol": { effort: "high", [key]: "override" } } }), /reserved/, key);
+  }
 });
 
 test("Desktopプロセスを検出できない環境では起動しない", () => {
