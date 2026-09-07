@@ -21,6 +21,7 @@ import {
 } from "../src/policy.mjs";
 import { WebSocketFrameDecoder } from "../src/websocket.mjs";
 import { protocol, schemaCommand } from "./fixtures/protocol.mjs";
+import { createSwitchRequest } from "../src/switch-config.mjs";
 
 const repository = "/Users/test/project";
 const repositoryRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -113,6 +114,15 @@ test.each([["直接中継", ["app-server"], false], ["CLI", [], true], ["Desktop
   assert.equal(readFileSync(calls, "utf8").trim().split("\n").map(JSON.parse).some((call) => call[0] === "app-server" && call[1] !== "generate-json-schema"), false);
 });
 
+// 呼び出し側の設定指定シナリオ（実装前の確認対象）:
+// - switch_main_modelのconfigでモデル別の既定値を項目単位に上書きし、effort以外の未指定項目を保持する。
+// - config.effortを必須とし、config省略・空オブジェクト・effort欠落では既定値で補わず中断前に拒否する。
+// - 同じモデルでもconfigの明示指定を受け付け、同じタスクで設定を適用して続行する。
+// - 使用中のCodexの通信仕様を基に未知の項目・不正な型や値を拒否し、設定追加用の固定許可リストを増やさない。
+// - タスク・入力・権限・作業場所などの保護項目と、モデルが対応しない思考量を中断前に拒否する。
+// - 呼び出し側指定を別タスク、グローバル設定、config.jsonへ書き戻さない。
+// - 切り替え・続行・競合時の安全性を回帰試験し、実機で呼び出し側設定の反映を確認する。
+
 // バージョン手動更新の撤去シナリオ（実装前の確認対象）:
 // - バージョン一覧の登録なしで、必要な通信仕様を持つCodexを利用できる。
 // - 未登録の新しい版でも必要な操作・項目が揃っていれば起動する。
@@ -129,18 +139,18 @@ test.each([["直接中継", ["app-server"], false], ["CLI", [], true], ["Desktop
 // 自律切り替えの修正シナリオ（実装前の確認対象）:
 // - メインタスクに変更ツールを追加し、既存ツールと指示を保持する。
 // - 理由なしの指定でSol→Astra→Solへ切り替え、同じタスクで追加入力なしに続行する。
-// - 同じモデル、不正な指定、利用不能モデルでは不要な中断や成功記録を発生させない。
+// - effort欠落、不正な指定、利用不能モデルでは不要な中断や成功記録を発生させない。
 // - 並行ツール、承認待ち、ユーザーの停止、開始失敗を安全に処理する。
 // - 別タスク、子エージェント、対象外の場所、権限、作業内容へ変更を波及させない。
 // - 旧モードや固定設定を撤去し、再接続と複数プロセスで状態を失わない。
 // - DesktopとCLIの実機で、実行モデル・同一タスク・自動続行を確認する。
 
-test.runIf(process.env.MODEL_ROUTER_LIVE === "1")("実機で同一タスクのSol→Astra→Solを追加入力なしに続行する", async () => {
+test.runIf(process.env.MODEL_ROUTER_LIVE === "1")("実機で同一タスクのSol→Astra→Solと同じモデルの設定変更を追加入力なしに続行する", async () => {
   const temporary = mkdtempSync("/private/tmp/model-router-live-");
   const innerCodexPath = process.env.MODEL_ROUTER_TEST_CODEX ?? "/Applications/ChatGPT.app/Contents/Resources/codex";
   const configPath = path.join(temporary, "config.json");
   writeFileSync(configPath, JSON.stringify(makeConfig({ innerCodexPath, enabledRepositories: [temporary], maxBufferedBytes: 32 * 1024 * 1024,
-    models: { "gpt-5.6-sol": { effort: "high", summary: "auto", personality: "pragmatic" }, "gpt-6-astra": { effort: "high", summary: "concise", personality: "friendly" } },
+    models: { "gpt-5.6-sol": { effort: "high", summary: "auto", personality: "pragmatic" }, "gpt-6-astra": { effort: "low", summary: "auto", personality: "pragmatic" } },
   })));
   const child = spawn(process.execPath, [path.join(repositoryRoot, "src/proxy.mjs"), "app-server", "--listen", "stdio://"], {
     cwd: temporary, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, CODEX_CLI_PATH: "", CODEX_MODEL_ROUTER_CONFIG: configPath, CODEX_MODEL_ROUTER_STATE_DIR: path.join(temporary, "router") },
@@ -188,10 +198,10 @@ test.runIf(process.env.MODEL_ROUTER_LIVE === "1")("実機で同一タスクのSo
     child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
     const started = await send("thread/start", {
       model: "gpt-5.6-sol", cwd: temporary, ephemeral: false, experimentalRawEvents: true,
-      developerInstructions: "This is a model-switch integration test. Do not use any tools except switch_main_model. Follow the user's three ordered steps exactly.",
+      developerInstructions: "This is a model-switch integration test. Do not use any tools except switch_main_model. Follow the user's four ordered steps exactly.",
     });
     testThread = started.thread;
-    await send("turn/start", { threadId: started.thread.id, effort: "high", input: [{ type: "text", text: "Do exactly these steps, in order: 1. Call switch_main_model with gpt-6-astra and await its result. 2. Then call switch_main_model with gpt-5.6-sol and await its result. 3. Respond with exactly MODEL_ROUTER_LIVE_OK. Do not call both tools in parallel. Do not do anything else." }] });
+    await send("turn/start", { threadId: started.thread.id, effort: "high", input: [{ type: "text", text: 'Do exactly these steps, in order: 1. Call switch_main_model({"model":"gpt-6-astra","config":{"effort":"high","summary":"concise","personality":"friendly"}}) and await its result. 2. Then call switch_main_model({"model":"gpt-5.6-sol","config":{"effort":"high"}}) and await its result. 3. Then call switch_main_model({"model":"gpt-5.6-sol","config":{"effort":"high","personality":"friendly"}}) to change settings on the same model and await its result. 4. Respond with exactly MODEL_ROUTER_LIVE_OK. Do not call tools in parallel. Do not do anything else.' }] });
     const result = await completed;
     writeFileSync(path.join(temporary, "events.json"), JSON.stringify(events, null, 2), { mode: 0o600 });
     console.log("Live evidence:", temporary, JSON.stringify(switches));
@@ -206,8 +216,8 @@ test.runIf(process.env.MODEL_ROUTER_LIVE === "1")("実機で同一タスクのSo
       const rollout = readFileSync(testThread.path, "utf8");
       writeFileSync(path.join(temporary, "rollout.jsonl"), rollout, { mode: 0o600 });
       const contexts = rollout.trim().split("\n").map(JSON.parse).filter((entry) => entry.type === "turn_context");
-      assert.deepEqual(contexts.map((entry) => [entry.payload.model, entry.payload.effort]), [["gpt-5.6-sol", "high"], ["gpt-6-astra", "high"], ["gpt-5.6-sol", "high"]]);
-      assert.deepEqual(contexts.map((entry) => entry.payload.personality), ["pragmatic", "friendly", "pragmatic"]);
+      assert.deepEqual(contexts.map((entry) => [entry.payload.model, entry.payload.effort]), [["gpt-5.6-sol", "high"], ["gpt-6-astra", "high"], ["gpt-5.6-sol", "high"], ["gpt-5.6-sol", "high"]]);
+      assert.deepEqual(contexts.map((entry) => entry.payload.personality), ["pragmatic", "friendly", "pragmatic", "friendly"]);
       assert.ok(events.some((entry) => entry.method === "thread/settings/updated" && entry.params.threadSettings.model === "gpt-6-astra" && entry.params.threadSettings.summary === "concise"), "Codex acknowledged the additional summary setting; effective reasoning summaries remain model-dependent");
       const responseTurns = events.filter((entry) => entry.method === "rawResponse/completed" ||
         (entry.method === "rawResponseItem/completed" && ["custom_tool_call", "function_call"].includes(entry.params.item.type))).map((entry) => entry.params.turnId);
@@ -242,7 +252,7 @@ function makeConfig(overrides = {}) {
 function makeEngine(config = makeConfig(), { compatible = true } = {}) {
   const diagnostics = new MemoryDiagnostics();
   const stateStore = new MemoryStateStore();
-  const engine = new RouterEngine({ config, diagnostics, stateStore, compatible });
+  const engine = new RouterEngine({ config, diagnostics, stateStore, compatible, switchRequest: createSwitchRequest(protocol, config.models) });
   engine.setModelCatalog([
     {
       model: "gpt-5.6-sol",
@@ -391,7 +401,7 @@ test("追加ツールと実験機能を既存の指示・ツール・通知設�
     added: action.message.params.dynamicTools.at(-1).name,
     instructions: action.message.params.developerInstructions,
     required: action.message.params.dynamicTools.at(-1).inputSchema.required,
-  }, { experimental: true, notifications: ["irrelevant"], first: existing, added: "switch_main_model", instructions: "keep instructions", required: ["model"] });
+  }, { experimental: true, notifications: ["irrelevant"], first: existing, added: "switch_main_model", instructions: "keep instructions", required: ["model", "config"] });
 });
 
 function beginSwitchTest(options = {}) {
@@ -403,7 +413,7 @@ function beginSwitchTest(options = {}) {
     ...options.params };
   engine.processClientMessage(turnRequest("begin", "main", params));
   engine.processServerMessage({ id: "begin", result: { turn: { id: "old-turn", status: "inProgress" } } });
-  const call = { id: "tool-call", method: "item/tool/call", params: { threadId: "main", turnId: "old-turn", callId: "switch-item", namespace: null, tool: "switch_main_model", arguments: { model: "gpt-6-astra" } } };
+  const call = { id: "tool-call", method: "item/tool/call", params: { threadId: "main", turnId: "old-turn", callId: "switch-item", namespace: null, tool: "switch_main_model", arguments: { model: "gpt-6-astra", config: { effort: "high" } } } };
   return { ...context, call };
 }
 
@@ -412,6 +422,110 @@ function switch_main_model(engine, call) {
   if (result.upstream[0]?.method !== "thread/backgroundTerminals/list") return result;
   return engine.processServerMessage({ id: result.upstream[0].id, result: { data: [], nextCursor: null } });
 }
+
+test.each([undefined, {}, { personality: "friendly" }, { effort: null }, { effort: "" }])("呼び出し側configのeffort欠落・空値を中断前に拒否する: %j", (config) => {
+  const { engine, call } = beginSwitchTest();
+  call.params.arguments = { model: "gpt-6-astra", ...(config === undefined ? {} : { config }) };
+  const result = engine.processServerMessage(call);
+  assert.deepEqual({ success: result.upstream[0]?.result?.success, active: engine.threads.main.activeTurnId, switching: engine.switches.size },
+    { success: false, active: "old-turn", switching: 0 });
+});
+
+test("呼び出し側configを既定値に優先して設定同期と続行へ渡し、設定元を書き換えない", () => {
+  const config = makeConfig({ models: { "gpt-5.6-sol": { effort: "high" }, "gpt-6-astra": { effort: "high", personality: "pragmatic", serviceTier: "default" } } });
+  const { engine, call } = beginSwitchTest({ config });
+  call.params.arguments.config = { effort: "xhigh", personality: "friendly" };
+  const original = structuredClone(config);
+  const interrupt = switch_main_model(engine, call).upstream[0];
+  assert.equal(interrupt.method, "turn/interrupt");
+  engine.processServerMessage({ id: interrupt.id, result: {} });
+  const settings = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } }).upstream[0];
+  const continuation = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
+  assert.deepEqual({ effort: settings.params.effort, modeEffort: settings.params.collaborationMode.settings.reasoning_effort,
+    continuedEffort: continuation.params.effort, personality: continuation.params.personality, tier: continuation.params.serviceTier, config },
+  { effort: "xhigh", modeEffort: "xhigh", continuedEffort: "xhigh", personality: "friendly", tier: "default", config: original });
+});
+
+test("同じモデルでも呼び出し側configを変更して同じタスクを続行する", () => {
+  const { engine, call } = beginSwitchTest();
+  call.params.arguments = { model: "gpt-5.6-sol", config: { effort: "xhigh" } };
+  const interrupt = switch_main_model(engine, call).upstream[0];
+  assert.equal(interrupt.method, "turn/interrupt");
+  engine.processServerMessage({ id: interrupt.id, result: {} });
+  const settings = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } }).upstream[0];
+  const continuation = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
+  assert.deepEqual([settings, continuation].map((request) => [request.params.threadId, request.params.model, request.params.effort]),
+    [["main", "gpt-5.6-sol", "xhigh"], ["main", "gpt-5.6-sol", "xhigh"]]);
+  engine.processServerMessage({ id: continuation.id, result: { turn: { id: "same-model-next", status: "inProgress" } } });
+  assert.equal(engine.threads.main.selectedEffort, "xhigh");
+  assert.equal(engine.switches.size, 0);
+});
+
+test.each([
+  { effort: "high", typoOption: true }, { effort: "high", personality: 1 }, { effort: "high", summary: "wrong" },
+  { effort: "unsupported" }, { effort: "medium" }, { effort: "high", threadId: "other" },
+  { effort: "high", approvalPolicy: "never" }, { effort: "high", cwd: "/other" }, { effort: "high", input: [] },
+  { effort: "high", responsesapiClientMetadata: { invalid: 42 } }, { effort: "high", serviceTier: false },
+])("呼び出し側configの未知項目・不正値・保護項目を中断前に拒否する: %j", (config) => {
+  const { engine, call } = beginSwitchTest();
+  call.params.arguments.config = config;
+  const result = engine.processServerMessage(call);
+  assert.deepEqual({ success: result.upstream[0]?.result?.success, active: engine.threads.main.activeTurnId, switching: engine.switches.size },
+    { success: false, active: "old-turn", switching: 0 });
+});
+
+test("続けて設定を変更しても、最初のターンの古い設定へ巻き戻さない", () => {
+  const { engine, call } = beginSwitchTest();
+  const outputSchema = { type: "object", properties: { answer: { type: "string" } } };
+  call.params.arguments.config = { effort: "high", outputSchema };
+  const interrupt = switch_main_model(engine, call).upstream[0];
+  engine.processServerMessage({ id: interrupt.id, result: {} });
+  const settings = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } }).upstream[0];
+  const continuation = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
+  engine.processServerMessage({ id: continuation.id, result: { turn: { id: "next-turn", status: "inProgress" } } });
+  call.params.turnId = "next-turn";
+  call.params.arguments = { model: "gpt-6-astra", config: { effort: "xhigh" } };
+  const nextInterrupt = switch_main_model(engine, call).upstream[0];
+  engine.processServerMessage({ id: nextInterrupt.id, result: {} });
+  const nextSettings = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "next-turn", status: "interrupted" } } }).upstream[0];
+  const nextContinuation = engine.processServerMessage({ id: nextSettings.id, result: {} }).upstream[0];
+  assert.deepEqual(nextContinuation.params.outputSchema, outputSchema);
+});
+
+test("設定の公開仕様と受付検証を共用し、未知項目・必須effort・不正な入れ子を拒否する", () => {
+  const contract = createSwitchRequest(protocol, makeConfig().models);
+  assert.deepEqual(contract.inputSchema.properties.config.required, ["effort"]);
+  assert.equal(contract.inputSchema.properties.config.additionalProperties, false);
+  assert.ok(Object.keys(contract.inputSchema.definitions).length < 5, "only referenced setting schemas are published");
+  for (const args of [null, [], "bad", { model: "gpt-6-astra", config: null }, { model: "gpt-6-astra", config: [] },
+    JSON.parse('{"model":"gpt-6-astra","config":{"effort":"high","__proto__":{}}}')]) assert.ok(contract.validateRequest(args));
+  assert.equal(contract.validateRequest({ model: "gpt-6-astra", config: { effort: "high", personality: null,
+    serviceTier: null, responsesapiClientMetadata: { source: "test" }, outputSchema: { type: "object", properties: { result: { type: "string" } } } } }), null);
+});
+
+test("Codexの仕様に追加された設定をコード側の項目追加なしで検証する", () => {
+  const future = structuredClone(protocol);
+  future.definitions.v2.FutureSetting = { type: "object", properties: {
+    labels: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, uniqueItems: true },
+    count: { type: "integer", minimum: 1, maximum: 3 },
+  }, required: ["labels", "count"], additionalProperties: false };
+  future.definitions.v2.TurnStartParams.properties.futureSetting = { $ref: "#/definitions/v2/FutureSetting" };
+  const contract = createSwitchRequest(future, makeConfig().models);
+  const request = (futureSetting) => ({ model: "gpt-6-astra", config: { effort: "high", futureSetting } });
+  assert.equal(contract.validateRequest(request({ labels: ["a"], count: 2 })), null);
+  for (const value of [{ labels: [], count: 2 }, { labels: [""], count: 2 }, { labels: ["a", "a"], count: 2 },
+    { labels: ["a"], count: 0 }, { labels: ["a"], count: 4 }, { labels: ["a"], count: 1.5 },
+    { labels: ["a"] }, { labels: ["a"], count: 2, typo: true }]) assert.ok(contract.validateRequest(request(value)));
+});
+
+test("解析できない設定仕様や欠落参照は受付を始める前に拒否する", () => {
+  for (const schema of [{ type: "string", format: "uri" }, { $ref: "#/definitions/Missing" },
+    { $ref: "https://example.invalid/schema" }, { type: "array", items: [] }]) {
+    const changed = structuredClone(protocol);
+    changed.definitions.v2.TurnStartParams.properties.newSetting = schema;
+    assert.throws(() => createSwitchRequest(changed, makeConfig().models), /schema/);
+  }
+});
 
 test("応答済みでも裏で動いているコマンドを確認し、残っていれば中断しない", () => {
   const { engine, call } = beginSwitchTest();
@@ -477,13 +591,13 @@ test("理由なしの変更は完了通知を待って同じタスクを新モ�
   assert.equal(diagnostics.events.at(-1).event, "switch-accepted");
 });
 
-test("同じモデル、不正指定、利用不能モデル、古いターン、子を中断しない", () => {
+test("effort欠落、不正指定、利用不能モデル、古いターン、子を中断しない", () => {
   const cases = [
-    { args: { model: "gpt-5.6-sol" }, success: true },
-    { args: { model: "gpt-6-astra", reason: "not allowed" }, success: false },
-    { args: { model: "unknown" }, success: false },
-    { args: { model: "gpt-6-astra" }, turnId: "old-other", success: false },
-    { args: { model: "gpt-6-astra" }, options: { parentThreadId: "parent" }, success: false },
+    { args: { model: "gpt-5.6-sol" }, success: false },
+    { args: { model: "gpt-6-astra", config: { effort: "high" }, reason: "not allowed" }, success: false },
+    { args: { model: "unknown", config: { effort: "high" } }, success: false },
+    { args: { model: "gpt-6-astra", config: { effort: "high" } }, turnId: "old-other", success: false },
+    { args: { model: "gpt-6-astra", config: { effort: "high" } }, options: { parentThreadId: "parent" }, success: false },
   ];
   for (const entry of cases) {
     const { engine, call } = beginSwitchTest(entry.options);
@@ -565,10 +679,11 @@ test("同じリポジトリのAだけをAstraへ変更し、Bの実行・承認�
 
 test("AとBの切り替え応答が交錯しても、それぞれ指定したモデルで続行する", () => {
   const { engine, call } = beginSwitchTest();
+  call.params.arguments.config = { effort: "xhigh", personality: "friendly" };
   announceThread(engine, "task-b", { model: "gpt-6-astra", effort: "high" });
   engine.processClientMessage(turnRequest("begin-b", "task-b", { model: "gpt-6-astra", effort: "high" }));
   engine.processServerMessage({ id: "begin-b", result: { turn: { id: "b-running", status: "inProgress" } } });
-  const callB = { ...call, id: "tool-b", params: { ...call.params, threadId: "task-b", turnId: "b-running", callId: "switch-b", arguments: { model: "gpt-5.6-sol" } } };
+  const callB = { ...call, id: "tool-b", params: { ...call.params, threadId: "task-b", turnId: "b-running", callId: "switch-b", arguments: { model: "gpt-5.6-sol", config: { effort: "high" } } } };
   const interruptA = switch_main_model(engine, call).upstream[0];
   const interruptB = switch_main_model(engine, callB).upstream[0];
   // Aは通知→応答、Bは応答→通知。設定の受付はB→Aと逆順にする。
@@ -580,6 +695,7 @@ test("AとBの切り替え応答が交錯しても、それぞれ指定したモ
   const continuationA = engine.processServerMessage({ id: settingsA.id, result: {} }).upstream[0];
   assert.deepEqual([settingsA, continuationA].map((request) => [request.params.threadId, request.params.model]), [["main", "gpt-6-astra"], ["main", "gpt-6-astra"]]);
   assert.deepEqual([settingsB, continuationB].map((request) => [request.params.threadId, request.params.model]), [["task-b", "gpt-5.6-sol"], ["task-b", "gpt-5.6-sol"]]);
+  assert.deepEqual([continuationA, continuationB].map((request) => [request.params.effort, request.params.personality]), [["xhigh", "friendly"], ["high", undefined]]);
   engine.processServerMessage({ id: continuationB.id, result: { turn: { id: "b-sol", status: "inProgress" } } });
   engine.processServerMessage({ id: continuationA.id, result: { turn: { id: "a-astra", status: "inProgress" } } });
   assert.equal(engine.threads.main.selectedModel, "gpt-6-astra");
@@ -647,7 +763,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   if (m.method === "thread/start") send({ id: m.id, result: { thread: { id: "main", parentThreadId: null, cwd: ${JSON.stringify(repository)}, model: "gpt-5.6-sol", status: { type: "idle" } } } });
   if (m.method === "turn/start") {
     send({ id: m.id, result: { turn: { id: "turn", status: "inProgress" } } });
-    send({ id: "switch", method: "item/tool/call", params: { threadId: "main", turnId: "turn", callId: "switch", namespace: null, tool: "switch_main_model", arguments: { model: "gpt-6-astra" } } });
+    send({ id: "switch", method: "item/tool/call", params: { threadId: "main", turnId: "turn", callId: "switch", namespace: null, tool: "switch_main_model", arguments: { model: "gpt-6-astra", config: { effort: "high" } } } });
   }
   if (m.method === "thread/backgroundTerminals/list") send({ id: m.id, result: { data: [], nextCursor: null } });
   if (m.method === "turn/interrupt") { send({ id: m.id, result: {} }); send({ method: "test/ready" }); }
