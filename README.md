@@ -60,11 +60,19 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/baton/bin/baton
 
 ### レスポンス形式
 
-成功時と中断前の失敗時では、結果の受け取り方が異なる。
+受付結果と、続行先へ渡す適用結果を分けて返す。
+
+#### 受付時：元のツール呼び出しを完了する
+
+検証を通過したら元の呼び出しへ `success: true` を返す。`contentItems[].text` は
+`{"status":"pending","model":"…","config":{…},"message":"…"}` というJSON文字列で、受付済み・設定未適用であることと、追加作業を始めず引き継ぎを待つことを伝える。
+Codexの `item/completed` でそのツールが成功完了したことを確認してから、中断・設定変更・続行へ進む。
+完了通知を待つ間に別作業や利用者の停止が入った場合、ツールが失敗した場合、30秒以内に完了通知を確認できない場合は切り替えを中止する。
+応答済みの呼び出しへ二重応答は返さず、以後の切り替え失敗はクライアントへの `error` 通知で伝える。
 
 #### 成功時：続行先へ渡す結果
 
-成功時は元の実行区間を終了し、同じタスクの続行先へ結果を渡す。元のツール呼び出しに `success: true` を返してそのまま進める方式ではない。続行要求の `toolOutput.name` は `switch_model`、`toolOutput.output` は次のJSONを文字列化した値になる。
+成功時は元の実行区間を終了し、同じタスクの続行先へ適用結果を渡す。受付時の `pending` は適用成功を意味しない。続行要求の `toolOutput.name` は `switch_model`、`toolOutput.output` は次のJSONを文字列化した値になる。
 
 ```json
 {
@@ -84,7 +92,7 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/baton/bin/baton
 - `status`：`applied`。続行先はこの結果を受け取り、未完了の作業を再開する
 - `message`：続行の指示。中断はユーザーではなく中継が行ったことを伝える
 
-#### 中断前の失敗時：ツールへの失敗応答
+#### 受付前の失敗時：ツールへの失敗応答
 
 例えば `{"model":"gpt-6-astra","config":{}}` を渡すと、他の実行条件に問題がなければ次の応答を返す。`id` は元のツール呼び出し要求のID。
 
@@ -108,6 +116,9 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/baton/bin/baton
 #### 中断後に続行が失敗した場合：クライアントへのエラー通知
 
 元の実行区間が終了済みのため、通常のツール失敗応答ではなく、デスクトップ／CLI側へ `error` 通知を送る。以下は続行要求が失敗した場合の例。
+
+切り替えのための内部中断はクライアントへ流さず、続行の開始・進捗を通知する。
+続行に失敗した場合は保留した中断完了通知も戻す。利用者による停止、別タスクの中断、通常の失敗通知はそのまま伝える。
 
 ```json
 {
@@ -146,4 +157,6 @@ npm run check
 ./bin/baton check
 # 実際のモデルを使用し、利用枠を消費する試験
 BATON_LIVE=1 npm test -- -t '実機で同一タスク'
+# 実際のCLIを疑似端末で起動し、Unix WebSocket経由の切り替え後に編集・検証まで行う
+npm run test:cli-live
 ```
