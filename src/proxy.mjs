@@ -4,7 +4,9 @@ import { spawn } from "node:child_process";
 import {
   accessSync,
   appendFileSync,
+  closeSync,
   mkdirSync,
+  openSync,
   readFileSync,
   constants as fsConstants,
 } from "node:fs";
@@ -51,6 +53,15 @@ function hasRequestId(message) {
 // 通知や応答と区別してJSON-RPC要求だけを判定する。
 function isRequest(message) {
   return hasRequestId(message) && typeof message.method === "string";
+}
+
+// 中断元の追跡に必要な識別子だけを記録し、入力・ツール結果・認証情報は残さない。
+export function recordControlMessage(diagnostics, source, message) {
+  if (!["turn/interrupt", "turn/start", "turn/steer", "thread/unsubscribe", "thread/archive", "thread/rollback", "thread/revert", "thread/settings/update", "turn/settings/update"].includes(message.method)) return;
+  diagnostics.record("control-request", {
+    source, method: message.method, requestId: message.id ?? null,
+    threadId: message.params?.threadId ?? null, turnId: message.params?.turnId ?? null,
+  });
 }
 
 // 保存値と受信値の参照を共有しないJSON互換コピーを作る。
@@ -115,7 +126,7 @@ export class Diagnostics {
   record(event, fields = {}) {
     appendFileSync(
       this.file,
-      `${JSON.stringify({ timestamp: this.now().toISOString(), event, ...fields })}\n`,
+      `${JSON.stringify({ timestamp: this.now().toISOString(), pid: process.pid, event, ...fields })}\n`,
       { encoding: "utf8", mode: 0o600 },
     );
   }
@@ -157,6 +168,7 @@ export class RouterEngine {
     this.modelCatalog = null;
     this.catalogError = null;
     this.switches = new Map();
+    this.internalInterruptions = new Set();
     this.serverRequests = new Map();
   }
 
@@ -272,6 +284,10 @@ export class RouterEngine {
       return;
     }
     const { threadId, turn, item } = message.params ?? {};
+    if (message.method === "turn/completed" && turn?.status === "interrupted" &&
+        this.internalInterruptions.has(JSON.stringify([threadId, turn.id]))) {
+      return { consume: true, upstream: [], downstream: [] };
+    }
     const thread = this.threads[threadId];
     if (message.method === "thread/started" && message.params?.thread) {
       this.#captureThread(message.params.thread);
@@ -296,12 +312,16 @@ export class RouterEngine {
       thread.activeItems = {};
     }
     this.#save();
+    const switching = this.switches.get(threadId);
+    if (message.method === "item/completed" && switching?.phase === "settle" &&
+        message.params.turnId === switching.turnId && item?.id === switching.call.params.callId &&
+        item.type === "dynamicToolCall") return this.switch_model(message);
     if (message.method === "turn/completed" && this.switches.has(threadId)) return this.switch_model(message);
   }
 
   // 切り替えツールの待機を区切りにし、Codexの正規手順で同じタスクを続行する。
   switch_model(message) {
-    const action = { consume: message.method !== "turn/completed", upstream: [], downstream: [] };
+    const action = { consume: !["turn/completed", "item/completed"].includes(message.method), upstream: [], downstream: [] };
     const pending = !message.method ? this.pending.get(requestKey(message.id)) : null;
     const threadId = pending?.threadId ?? message.params?.threadId;
     const thread = this.threads[threadId];
@@ -335,13 +355,38 @@ export class RouterEngine {
     } else if (!state) {
       if (pending) this.pending.delete(requestKey(message.id));
       return action;
+    } else if (message.method === "item/completed") {
+      this.pending.delete(requestKey(state.requestId));
+      const item = message.params.item;
+      if (state.cancelled || item.status !== "completed" || item.success !== true ||
+          Object.keys(thread.activeItems).length || [...this.serverRequests.values()].includes(threadId) ||
+          thread.activeTurnId !== state.turnId) {
+        this.switches.delete(threadId);
+        this.diagnostics.record("switch-failed", { threadId, phase: "settle", error: "Switch tool did not settle alone in the active turn." });
+        action.downstream.push({ method: "error", params: { threadId, turnId: state.turnId, willRetry: false,
+          error: { message: "Model switch cancelled before interruption: the tool failed, the turn stopped, or other work started.", codexErrorInfo: null, additionalDetails: null } } });
+        return action;
+      }
+      state.phase = "interrupt";
     } else if (message.method === "turn/completed") {
+      if (message.params.turn?.id === state.turnId && state.phase === "settle") {
+        this.pending.delete(requestKey(state.requestId));
+        this.switches.delete(threadId);
+        this.diagnostics.record("switch-failed", { threadId, phase: "settle", error: "Turn ended before switch tool settled." });
+        if (!state.cancelled) action.downstream.push({ method: "error", params: { threadId, turnId: state.turnId, willRetry: false,
+          error: { message: "Model switch cancelled: the calling turn ended before handoff.", codexErrorInfo: null, additionalDetails: null } } });
+        return action;
+      }
       if (message.params.turn?.id !== state.turnId || state.phase !== "interrupt") return action;
       state.interrupted = message.params.turn.status === "interrupted";
       if (!state.interrupted || state.cancelled) {
         this.switches.delete(threadId);
         return action;
       }
+      // 内部の中断を利用者の停止として表示しない。続行不能時だけ元の通知を戻す。
+      state.interruptionNotification = cloneJson(message);
+      this.internalInterruptions.add(JSON.stringify([threadId, state.turnId]));
+      action.consume = true;
       if (!state.interruptAccepted) return action;
       state.phase = "settings";
     } else {
@@ -354,16 +399,18 @@ export class RouterEngine {
           this.switches.set(threadId, state);
           this.pending.set(requestKey(message.id), pending);
         }
-        if (!state.interrupted) {
+        if (!state.callResolved) {
           action.upstream.push({ id: state.call.id, result: { success: false,
             contentItems: [{ type: "inputText", text: message.error.message }] } });
         } else {
           action.downstream.push({ method: "error", params: { threadId, turnId: state.turnId, willRetry: false,
             error: { message: "Model switch did not continue: " + message.error.message, codexErrorInfo: null, additionalDetails: null } } });
         }
+        this.#releaseInterruption(state, action);
         return action;
       }
       if (state.cancelled) {
+        this.#releaseInterruption(state, action);
         if (state.phase === "inspect") action.upstream.push({ id: state.call.id, result: { success: false,
           contentItems: [{ type: "inputText", text: "Model switch cancelled by a user operation." }] } });
         if (state.phase === "continue" && message.result?.turn?.status === "inProgress") {
@@ -385,7 +432,9 @@ export class RouterEngine {
             contentItems: [{ type: "inputText", text: "Background commands are running or their state could not be verified. Await them before switching." }] } });
           return action;
         }
-        state.phase = "interrupt";
+        // 応答を返しただけでは中断しない。Codex側のツール完了通知を待つ。
+        state.phase = "settle";
+        state.callResolved = true;
       } else if (state.phase === "interrupt") {
         state.interruptAccepted = true;
         if (!state.interrupted) return action;
@@ -398,6 +447,7 @@ export class RouterEngine {
         if (!turn?.id || turn.status !== "inProgress") {
           action.downstream.push({ method: "error", params: { threadId, turnId: state.turnId, willRetry: false,
             error: { message: "Model switch did not start an active turn.", codexErrorInfo: null, additionalDetails: null } } });
+          this.#releaseInterruption(state, action);
           return action;
         }
         thread.activeTurnId = turn.id;
@@ -442,8 +492,24 @@ export class RouterEngine {
       }) };
     }
     this.pending.set(requestKey(id), { kind: "switch", threadId, params: cloneJson(params) });
+    if (state.phase === "settle") {
+      action.upstream.push({ id: state.call.id, result: { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({
+        status: "pending", model: state.model, config: state.settings,
+        message: "Baton accepted the handoff request; settings are not applied yet. Do not start further work. Baton will interrupt and continue this task with the requested settings.",
+      }) }] } });
+      action.waitFor = [{ id, method: "item/completed", params: { threadId, turnId: state.turnId } }];
+      return action;
+    }
     action.upstream.push({ id, method, params });
     return action;
+  }
+
+  // 続行失敗・利用者の取消では終了状態をCLIにも伝え、実行中表示を残さない。
+  #releaseInterruption(state, action) {
+    if (!state.interruptionNotification) return;
+    action.downstream.push(state.interruptionNotification);
+    state.interruptionNotification = null;
+    this.internalInterruptions.delete(JSON.stringify([state.threadId, state.turnId]));
   }
 
   #availabilityError(model, effort) {
@@ -601,6 +667,7 @@ export function runAppServerProxy({
   clientReadable = process.stdin,
   clientWritable = process.stdout,
   clientName = "Desktop",
+  serverStderr = "pipe",
   onExit = () => {},
 }) {
   const diagnostics = new Diagnostics(stateDirectory);
@@ -612,7 +679,7 @@ export function runAppServerProxy({
 
   const child = spawn(innerCodexPath, args, {
     env: { ...process.env, CODEX_CLI_PATH: "" },
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", serverStderr],
   });
 
   const activeClientRequestIds = new Set();
@@ -649,8 +716,10 @@ export function runAppServerProxy({
   };
 
   const forwardClientMessage = (line, message) => {
+    recordControlMessage(diagnostics, "client", message);
     const action = engine.processClientMessage(message);
     if (action.type === "local-error") {
+      diagnostics.record("control-rejected", { requestId: message.id, method: message.method });
       writeRespectingBackpressure(clientWritable, `${JSON.stringify(action.message)}\n`, child.stdout);
       return;
     }
@@ -761,6 +830,11 @@ export function runAppServerProxy({
           activeClientRequestIds.delete(requestKey(message.id));
         }
         const action = engine.processServerMessage(message);
+        if (["turn/started", "turn/completed"].includes(message.method)) {
+          diagnostics.record("turn-state", { source: "server", method: message.method,
+            threadId: message.params?.threadId, turnId: message.params?.turn?.id,
+            status: message.params?.turn?.status });
+        }
         for (const [id, timer] of switchTimers) {
           if (!engine.pending.has(requestKey(id))) {
             clearTimeout(timer);
@@ -768,8 +842,14 @@ export function runAppServerProxy({
           }
         }
         for (const outgoing of action?.upstream ?? []) {
+          recordControlMessage(diagnostics, "baton", outgoing);
           writeRespectingBackpressure(child.stdin, JSON.stringify(outgoing) + "\n", clientReadable);
-          if (outgoing.method) switchTimers.set(outgoing.id, setTimeout(() => {
+        }
+        const timedRequests = [...(action?.upstream ?? []).filter(outgoing => outgoing.method), ...(action?.waitFor ?? [])];
+        for (const outgoing of timedRequests) {
+          switchTimers.set(outgoing.id, setTimeout(() => {
+            diagnostics.record("switch-request-timeout", { requestId: outgoing.id, method: outgoing.method,
+              threadId: outgoing.params?.threadId, turnId: outgoing.params?.turnId });
             serverDecoder.onLine(JSON.stringify({ id: outgoing.id, error: {
               code: -32091, message: "baton: " + outgoing.method + " timed out",
             } }));
@@ -794,6 +874,7 @@ export function runAppServerProxy({
     }
   });
   clientReadable.on("end", () => {
+    diagnostics.record("client-input-ended");
     try {
       clientDecoder.end();
       if (!failed) child.stdin.end();
@@ -817,7 +898,7 @@ export function runAppServerProxy({
       failProtocol(error);
     }
   });
-  child.stderr.on("data", (chunk) => writeRespectingBackpressure(process.stderr, chunk, child.stderr));
+  child.stderr?.on("data", (chunk) => writeRespectingBackpressure(process.stderr, chunk, child.stderr));
   child.on("error", failProtocol);
   child.on("exit", (code, signal) => {
     childExited = true;
@@ -861,24 +942,33 @@ function parseUnixListenUrl(listenUrl) {
 // CLI TUIのWebSocketを既存のstdio RouterEngineへ接続する。
 export function runCliWebSocketProxy({ config, innerCodexPath, listenUrl, stateDirectory }) {
   const socketPath = parseUnixListenUrl(listenUrl);
+  const diagnostics = new Diagnostics(stateDirectory);
   let server;
   server = createUnixWebSocketLineServer({
     socketPath,
     maxPayloadBytes: config.maxBufferedBytes,
+    onEvent: (event, fields) => diagnostics.record(event, fields),
     onConnection(transport) {
-      runAppServerProxy({
-        config,
-        innerCodexPath,
-        args: ["app-server", "--listen", "stdio://"],
-        stateDirectory,
-        clientReadable: transport.readable,
-        clientWritable: transport.writable,
-        clientName: "Codex CLI",
-        onExit() {
-          transport.close();
-          server.close();
-        },
-      });
+      // TUIと同じ端末へサーバー内部ログを書かず、子プロセスから直接保存する。
+      const serverStderr = openSync(path.join(stateDirectory, "app-server.stderr.log"), "a", 0o600);
+      try {
+        runAppServerProxy({
+          config,
+          innerCodexPath,
+          args: ["app-server", "--listen", "stdio://"],
+          stateDirectory,
+          clientReadable: transport.readable,
+          clientWritable: transport.writable,
+          clientName: "Codex CLI",
+          serverStderr,
+          onExit() {
+            transport.close();
+            server.close();
+          },
+        });
+      } finally {
+        closeSync(serverStderr);
+      }
     },
   });
   server.on("error", (error) => {
@@ -903,6 +993,12 @@ function printCheck(config, innerCodexPath) {
 // 実行種別を検証して診断、透過委譲、App Server中継へ振り分ける。
 export function main(args = process.argv.slice(2)) {
   const config = loadConfig();
+  if (args[0] === "--router-cli-exit") {
+    if (args.length !== 2 || !/^\d{1,3}$/.test(args[1]) || Number(args[1]) > 255) throw new Error("invalid CLI exit code");
+    new Diagnostics(process.env.CODEX_BATON_STATE_DIR ?? config.stateDirectory ?? DEFAULT_STATE_DIR)
+      .record("cli-exit", { code: Number(args[1]) });
+    return;
+  }
   const innerCodexPath = resolveInnerCodex(config);
   if (args.length === 1 && args[0] === "--router-check") {
     printCheck(config, innerCodexPath);
