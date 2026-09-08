@@ -177,14 +177,16 @@ function createFrameWritable(socket, maxPayloadBytes) {
 }
 
 // Upgrade済みsocketを既存stdioルーターが扱える入出力ストリームへ変換する。
-function createLineTransport(socket, head, maxPayloadBytes) {
+function createLineTransport(socket, head, maxPayloadBytes, onEvent) {
   const readable = new PassThrough();
   const writable = createFrameWritable(socket, maxPayloadBytes);
   let closed = false;
 
-  const close = (payload = Buffer.alloc(0)) => {
+  const close = (payload = Buffer.alloc(0), source = "server") => {
     if (closed) return;
     closed = true;
+    // close理由の自由文には利用者のデータが混ざり得るため、コードと発生元だけ残す。
+    onEvent("websocket-closed", { source, code: payload.length >= 2 ? payload.readUInt16BE(0) : null });
     if (!socket.destroyed) {
       socket.end(encodeFrame(0x08, payload));
     }
@@ -194,6 +196,7 @@ function createLineTransport(socket, head, maxPayloadBytes) {
   const fail = (error) => {
     if (closed) return;
     closed = true;
+    onEvent("websocket-error", { code: typeof error.code === "string" ? error.code : null });
     const reason = Buffer.from(error.message, "utf8").subarray(0, 123);
     const payload = Buffer.alloc(2 + reason.length);
     payload.writeUInt16BE(1002, 0);
@@ -212,14 +215,14 @@ function createLineTransport(socket, head, maxPayloadBytes) {
       if (!socket.destroyed) socket.write(encodeFrame(0x0a, payload));
     },
     onClose(payload) {
-      close(payload);
+      close(payload, "client-close-frame");
     },
     onError: fail,
   });
 
   socket.on("data", (chunk) => decoder.push(chunk));
-  socket.on("end", () => close());
-  socket.on("close", () => close());
+  socket.on("end", () => close(undefined, "socket-end"));
+  socket.on("close", () => close(undefined, "socket-close"));
   socket.on("error", fail);
   writable.on("error", fail);
   if (head.length > 0) decoder.push(head);
@@ -235,7 +238,7 @@ function rejectUpgrade(socket, status, message) {
 }
 
 // Unix socket上のローカルCLI一接続だけを受けるWebSocketサーバーを起動する。
-export function createUnixWebSocketLineServer({ socketPath, maxPayloadBytes, onConnection }) {
+export function createUnixWebSocketLineServer({ socketPath, maxPayloadBytes, onConnection, onEvent = () => {} }) {
   let accepted = false;
   const server = createServer((_request, response) => {
     response.writeHead(404).end();
@@ -260,11 +263,12 @@ export function createUnixWebSocketLineServer({ socketPath, maxPayloadBytes, onC
     }
 
     accepted = true;
+    onEvent("websocket-connected", {});
     const accept = createHash("sha1").update(`${key}${WEBSOCKET_GUID}`).digest("base64");
     socket.write(
       `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
     );
-    const transport = createLineTransport(socket, head, maxPayloadBytes);
+    const transport = createLineTransport(socket, head, maxPayloadBytes, onEvent);
     try {
       onConnection(transport);
     } catch (error) {
