@@ -12,7 +12,8 @@
   },
   "scripts": {
     "check": "node --check src/policy.mjs && node --check src/proxy.mjs && node --check src/websocket.mjs",
-    "test": "vitest run tests/proxy.test.mjs"
+    "test": "vitest run tests",
+    "test:cli-live": "BATON_CLI_LIVE=1 vitest run tests/cli-live.test.mjs"
   },
   "devDependencies": {
     "vitest": "^4.1.11"
