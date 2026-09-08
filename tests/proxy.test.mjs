@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -13,12 +13,12 @@ import {
   MemoryStateStore,
   RouterEngine,
   runAppServerProxy,
+  recordControlMessage,
 } from "../src/proxy.mjs";
 import {
   isRepositoryEnabled,
   validateConfig,
 } from "../src/policy.mjs";
-import { WebSocketFrameDecoder } from "../src/websocket.mjs";
 import { protocol, schemaCommand } from "./fixtures/protocol.mjs";
 import { createSwitchRequest } from "../src/switch-config.mjs";
 
@@ -112,40 +112,6 @@ test.each([["直接中継", ["app-server"], false], ["CLI", [], true], ["Desktop
   assert.match(result.stderr + result.stdout, /incompatible|schema|protocol/i);
   assert.equal(readFileSync(calls, "utf8").trim().split("\n").map(JSON.parse).some((call) => call[0] === "app-server" && call[1] !== "generate-json-schema"), false);
 });
-
-// モデル定義を呼び出し側へ一本化するシナリオ（実装前の確認対象）:
-// - modelsのない起動設定で起動し、設定ファイルにモデルを登録せず切り替えられる。
-// - Codexのカタログにあるモデルを受け付け、存在しないモデル・非対応のeffort・取得不能なカタログでは中断前に拒否する。
-// - modelとconfig.effortの必須検証、および設定の型・列挙値・保護項目の検証を維持する。
-// - 呼び出し側のconfigだけを切り替えへ適用し、起動設定にmodelsが残っていても参照・補完しない。
-// - 通常の実行開始にはモデル・effort・追加設定を補わず、利用者の要求をそのまま渡す。
-// - 同じモデルの設定変更・同一タスクの続行・タスク間の分離を維持し、本番config.jsonへ書き込まない。
-// - モデル定義のない試験設定で、デスクトップ版とCLI版の実モデルによる切り替え・続行を確認する。
-
-// 呼び出し側の設定指定シナリオ（実装前の確認対象）:
-// - switch_modelのconfigをそのまま適用し、省略項目はCodexの引き継ぎ規則に任せる。
-// - config.effortを必須とし、config省略・空オブジェクト・effort欠落では既定値で補わず中断前に拒否する。
-// - 同じモデルでもconfigの明示指定を受け付け、同じタスクで設定を適用して続行する。
-// - 使用中のCodexの通信仕様を基に未知の項目・不正な型や値を拒否し、設定追加用の固定許可リストを増やさない。
-// - タスク・入力・権限・作業場所などの保護項目と、モデルが対応しない思考量を中断前に拒否する。
-// - 呼び出し側指定を別タスク、グローバル設定、config.jsonへ書き戻さない。
-// - 切り替え・続行・競合時の安全性を回帰試験し、実機で呼び出し側設定の反映を確認する。
-
-// バージョン手動更新の撤去シナリオ（実装前の確認対象）:
-// - バージョン一覧の登録なしで、必要な通信仕様を持つCodexを利用できる。
-// - 未登録の新しい版でも必要な操作・項目が揃っていれば起動する。
-// - 必須機能の欠落、仕様取得の失敗・時間切れは理由を示して起動を拒否する。
-// - CLI・Desktop・直接中継の入口で同じ判定を使い、タスクや推論を作らず検査する。
-// - 本番とサンプルからsupportedCliVersionsを外し、既存の切り替え・タスク分離を維持する。
-
-// 自律切り替えの修正シナリオ（実装前の確認対象）:
-// - メインタスクに変更ツールを追加し、既存ツールと指示を保持する。
-// - 理由なしの指定でSol→Astra→Solへ切り替え、同じタスクで追加入力なしに続行する。
-// - effort欠落、不正な指定、利用不能モデルでは不要な中断や成功記録を発生させない。
-// - 並行ツール、承認待ち、ユーザーの停止、開始失敗を安全に処理する。
-// - 別タスク、子エージェント、対象外の場所、権限、作業内容へ変更を波及させない。
-// - 旧モードや固定設定を撤去し、再接続と複数プロセスで状態を失わない。
-// - DesktopとCLIの実機で、実行モデル・同一タスク・自動続行を確認する。
 
 test.runIf(process.env.BATON_LIVE === "1")("実機で同一タスクのSol→Astra→Solと同じモデルの設定変更を追加入力なしに続行する", async () => {
   const temporary = mkdtempSync("/private/tmp/baton-live-");
@@ -303,20 +269,6 @@ function turnRequest(id, threadId, overrides = {}) {
   };
 }
 
-// CLIクライアントと同じマスク付きWebSocketフレームをテスト用に組み立てる。
-function maskedFrame(payload, { final = true, opcode = 0x01 } = {}) {
-  const body = Buffer.from(payload);
-  assert.ok(body.length <= 125, "test frame must use the short payload format");
-  const mask = Buffer.from([0x12, 0x34, 0x56, 0x78]);
-  const masked = Buffer.from(body);
-  for (let index = 0; index < masked.length; index += 1) masked[index] ^= mask[index % 4];
-  return Buffer.concat([
-    Buffer.from([(final ? 0x80 : 0x00) | opcode, 0x80 | body.length]),
-    mask,
-    masked,
-  ]);
-}
-
 test("分割到着と複数同時到着のJSON行を復元する", () => {
   const lines = [];
   const decoder = new JsonLineDecoder({ maxBufferedBytes: 1024, onLine: (line) => lines.push(line) });
@@ -329,38 +281,6 @@ test("分割到着と複数同時到着のJSON行を復元する", () => {
 test("上限を超えるプロトコル行を拒否する", () => {
   const decoder = new JsonLineDecoder({ maxBufferedBytes: 8, onLine() {} });
   assert.throws(() => decoder.push(Buffer.from("123456789")), /exceeds 8 bytes/);
-});
-
-test("分割されたWebSocketテキストフレームをCLI入力へ復元する", () => {
-  const messages = [];
-  const errors = [];
-  const decoder = new WebSocketFrameDecoder({
-    maxPayloadBytes: 1024,
-    onText: (message) => messages.push(message),
-    onPing() {},
-    onClose() {},
-    onError: (error) => errors.push(error),
-  });
-  const first = maskedFrame('{"method":"turn/', { final: false });
-  const second = maskedFrame('start"}', { opcode: 0x00 });
-  decoder.push(first.subarray(0, 3));
-  decoder.push(Buffer.concat([first.subarray(3), second]));
-
-  assert.deepEqual(messages, ['{"method":"turn/start"}']);
-  assert.deepEqual(errors, []);
-});
-
-test("マスクされていないWebSocketクライアント入力を拒否する", () => {
-  const errors = [];
-  const decoder = new WebSocketFrameDecoder({
-    maxPayloadBytes: 1024,
-    onText() {},
-    onPing() {},
-    onClose() {},
-    onError: (error) => errors.push(error),
-  });
-  decoder.push(Buffer.from([0x81, 0x02, 0x7b, 0x7d]));
-  assert.match(errors[0].message, /must be masked/);
 });
 
 test("共通接頭辞を持つ別リポジトリを対象に含めない", () => {
@@ -428,8 +348,114 @@ function beginSwitchTest(options = {}) {
 function switch_model(engine, call) {
   const result = engine.processServerMessage(call);
   if (result.upstream[0]?.method !== "thread/backgroundTerminals/list") return result;
-  return engine.processServerMessage({ id: result.upstream[0].id, result: { data: [], nextCursor: null } });
+  const reply = engine.processServerMessage({ id: result.upstream[0].id, result: { data: [], nextCursor: null } });
+  if (!reply.waitFor) return reply;
+  return engine.processServerMessage({ method: "item/completed", params: { threadId: call.params.threadId, turnId: call.params.turnId,
+    item: { id: call.params.callId, type: "dynamicToolCall", status: "completed", success: true } } });
 }
+
+test("切り替えツールへ一度応答し、Codexの完了通知まで中断しない", () => {
+  const { engine, call, diagnostics } = beginSwitchTest();
+  announceThread(engine, "other", { model: "gpt-5.6-sol" });
+  const otherBefore = structuredClone(engine.threads.other);
+  const inspect = engine.processServerMessage(call).upstream[0];
+  const reply = engine.processServerMessage({ id: inspect.id, result: { data: [], nextCursor: null } });
+  assert.equal(reply.upstream.length, 1);
+  assert.equal(reply.upstream[0].id, call.id);
+  assert.equal(JSON.parse(reply.upstream[0].result.contentItems[0].text).status, "pending");
+  assert.equal(reply.upstream[0].method, undefined);
+  assert.equal(reply.waitFor.length, 1);
+  const done = { method: "item/completed", params: { threadId: "main", turnId: "old-turn",
+    item: { id: call.params.callId, type: "dynamicToolCall", status: "completed", success: true } } };
+  assert.equal(engine.processServerMessage({ ...done, params: { ...done.params, turnId: "unrelated-turn" } })?.upstream?.length ?? 0, 0);
+  assert.equal(engine.switches.get("main").phase, "settle", "別ターンの通知では待機を解除しない");
+  const action = engine.processServerMessage(done);
+  assert.equal(action.consume, false);
+  assert.equal(action.upstream[0].method, "turn/interrupt");
+  assert.equal(engine.processServerMessage(done)?.upstream?.length ?? 0, 0);
+  const failure = engine.processServerMessage({ id: action.upstream[0].id, error: { code: -1, message: "cannot interrupt" } });
+  assert.equal(failure.upstream.length, 0, "応答済みのツールへ二重応答しない");
+  assert.match(failure.downstream[0].params.error.message, /cannot interrupt/);
+  assert.deepEqual(engine.threads.other, otherBefore);
+  assert.equal(diagnostics.events.some(e => e.event === "switch-accepted"), false);
+});
+
+test.each(["stop", "other-work", "failed", "timeout", "turn-end"])("ツール応答後の%sは未応答中断や勝手な続行を起こさない", (race) => {
+  const { engine, call } = beginSwitchTest();
+  const inspect = engine.processServerMessage(call).upstream[0];
+  const reply = engine.processServerMessage({ id: inspect.id, result: { data: [], nextCursor: null } });
+  if (race === "stop") engine.processClientMessage({ id: "stop", method: "turn/interrupt", params: { threadId: "main", turnId: "old-turn" } });
+  if (race === "other-work") engine.processServerMessage({ method: "item/started", params: { threadId: "main", turnId: "old-turn", item: { id: "command", type: "commandExecution" } } });
+  const event = race === "timeout" ? { id: reply.waitFor[0].id, error: { code: -1, message: "baton: item/completed timed out" } }
+    : race === "turn-end" ? { method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "completed" } } }
+    : { method: "item/completed", params: { threadId: "main", turnId: "old-turn", item: { id: call.params.callId, type: "dynamicToolCall",
+      status: race === "failed" ? "failed" : "completed", success: race !== "failed" } } };
+  const result = engine.processServerMessage(event);
+  assert.equal(result.upstream.length, 0);
+  assert.equal(result.downstream[0].method, "error");
+  assert.equal(engine.switches.size, 0);
+  assert.equal(engine.pending.size, 0);
+});
+
+test("制御ログは発行元と識別子を区別し、本文・設定・認証情報を保存しない", () => {
+  const diagnostics = new MemoryDiagnostics();
+  const message = { id: "request", method: "turn/interrupt", params: {
+    threadId: "main", turnId: "turn", input: "SECRET", authorization: "SECRET", config: { secret: "SECRET" },
+  } };
+  for (const source of ["client", "baton"]) recordControlMessage(diagnostics, source, message);
+  recordControlMessage(diagnostics, "client", { ...message, method: "account/login/start" });
+  assert.deepEqual(diagnostics.events, ["client", "baton"].map(source => ({
+    event: "control-request", source, method: "turn/interrupt", requestId: "request", threadId: "main", turnId: "turn",
+  })));
+  assert.ok(!JSON.stringify(diagnostics.events).includes("SECRET"));
+});
+
+test.each(["response-first", "notification-first"])("連続切り替えは内部中断を表示せず、旧通知と利用者の停止を区別する: %s", (order) => {
+  const { engine, call, diagnostics } = beginSwitchTest();
+  const stale = [];
+  let activeTurn = "old-turn";
+  for (const [index, model, effort] of [[0, "gpt-6-astra", "high"], [1, "gpt-5.6-sol", "high"], [2, "gpt-5.6-sol", "xhigh"]]) {
+    const request = structuredClone(call);
+    request.id = `tool-${index}`;
+    request.params.turnId = activeTurn;
+    request.params.arguments = { model, config: { effort } };
+    const interrupt = switch_model(engine, request).upstream[0];
+    const response = { id: interrupt.id, result: {} };
+    const notification = { method: "turn/completed", params: { threadId: "main", turn: { id: activeTurn, status: "interrupted" } } };
+    const pair = order === "response-first" ? [response, notification] : [notification, response];
+    const first = engine.processServerMessage(pair[0]);
+    const second = engine.processServerMessage(pair[1]);
+    assert.equal(first.upstream.length, 0);
+    assert.equal((order === "response-first" ? second : first).consume, true, "内部中断は表示しない");
+    const settings = second.upstream[0];
+    const start = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
+    assert.deepEqual([settings.method, start.method], ["thread/settings/update", "turn/start"]);
+    assert.deepEqual([settings, start].map(r => [r.params.threadId, r.params.model, r.params.effort]),
+      [["main", model, effort], ["main", model, effort]]);
+    activeTurn = `new-${index}`;
+    const started = { id: start.id, result: { turn: { id: activeTurn, status: "inProgress" } } };
+    engine.processServerMessage(started);
+    assert.notEqual(engine.processServerMessage({ method: "turn/started", params: { threadId: "main", turn: started.result.turn } })?.consume, true);
+    stale.push(response, notification, started);
+    for (const old of stale) {
+      const replayed = engine.processServerMessage(old);
+      assert.equal(replayed?.upstream?.length ?? 0, 0);
+      if (old.method === "turn/completed") assert.equal(replayed.consume, true, "遅れた内部中断も表示しない");
+    }
+    assert.equal(engine.threads.main.activeTurnId, activeTurn);
+    assert.equal(engine.threads.main.selectedModel, model);
+    assert.equal(engine.threads.main.selectedEffort, effort);
+    assert.equal(engine.pending.size, 0);
+    assert.equal(engine.switches.size, 0);
+  }
+  assert.equal(diagnostics.events.filter(e => e.event === "switch-accepted").length, 3);
+  assert.notEqual(engine.processServerMessage({ method: "turn/completed", params: { threadId: "other", turn: { id: "old-turn", status: "interrupted" } } })?.consume, true);
+  const stop = { id: "user-stop", method: "turn/interrupt", params: { threadId: "main", turnId: activeTurn } };
+  assert.deepEqual(engine.processClientMessage(stop).message, stop);
+  assert.notEqual(engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: activeTurn, status: "interrupted" } } })?.consume, true);
+  assert.equal(engine.threads.main.activeTurnId, null);
+  assert.equal(engine.switches.size, 0);
+});
 
 test.each([undefined, {}, { personality: "friendly" }, { effort: null }, { effort: "" }])("呼び出し側configのeffort欠落・空値を中断前に拒否する: %j", (config) => {
   const { engine, call } = beginSwitchTest();
@@ -437,36 +463,6 @@ test.each([undefined, {}, { personality: "friendly" }, { effort: null }, { effor
   const result = engine.processServerMessage(call);
   assert.deepEqual({ success: result.upstream[0]?.result?.success, active: engine.threads.main.activeTurnId, switching: engine.switches.size },
     { success: false, active: "old-turn", switching: 0 });
-});
-
-test("起動設定のモデル定義を参照せず呼び出し側configだけを設定同期と続行へ渡す", () => {
-  const config = makeConfig({ models: { "gpt-5.6-sol": { effort: "high" }, "gpt-6-astra": { effort: "high", personality: "pragmatic", serviceTier: "default" } } });
-  const { engine, call } = beginSwitchTest({ config });
-  call.params.arguments.config = { effort: "xhigh", personality: "friendly" };
-  const original = structuredClone(config);
-  const interrupt = switch_model(engine, call).upstream[0];
-  assert.equal(interrupt.method, "turn/interrupt");
-  engine.processServerMessage({ id: interrupt.id, result: {} });
-  const settings = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } }).upstream[0];
-  const continuation = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
-  assert.deepEqual({ effort: settings.params.effort, modeEffort: settings.params.collaborationMode.settings.reasoning_effort,
-    continuedEffort: continuation.params.effort, personality: continuation.params.personality, tier: continuation.params.serviceTier, config },
-  { effort: "xhigh", modeEffort: "xhigh", continuedEffort: "xhigh", personality: "friendly", tier: undefined, config: original });
-});
-
-test("同じモデルでも呼び出し側configを変更して同じタスクを続行する", () => {
-  const { engine, call } = beginSwitchTest();
-  call.params.arguments = { model: "gpt-5.6-sol", config: { effort: "xhigh" } };
-  const interrupt = switch_model(engine, call).upstream[0];
-  assert.equal(interrupt.method, "turn/interrupt");
-  engine.processServerMessage({ id: interrupt.id, result: {} });
-  const settings = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } }).upstream[0];
-  const continuation = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
-  assert.deepEqual([settings, continuation].map((request) => [request.params.threadId, request.params.model, request.params.effort]),
-    [["main", "gpt-5.6-sol", "xhigh"], ["main", "gpt-5.6-sol", "xhigh"]]);
-  engine.processServerMessage({ id: continuation.id, result: { turn: { id: "same-model-next", status: "inProgress" } } });
-  assert.equal(engine.threads.main.selectedEffort, "xhigh");
-  assert.equal(engine.switches.size, 0);
 });
 
 test.each([
@@ -557,7 +553,7 @@ test("設定変更と切り替えを競合させず、中断前の取消はツ�
 });
 
 test("続行では古い権限を再送せず、最新の作業モードとターン限定設定を保持する", () => {
-  const { engine, call } = beginSwitchTest({ params: { permissions: "old-profile", cwd: "/repo/app", runtimeWorkspaceRoots: ["/repo/app"], environments: [], additionalContext: { a: { text: "keep" } } } });
+  const { engine, call, diagnostics } = beginSwitchTest({ params: { permissions: "old-profile", cwd: "/repo/app", runtimeWorkspaceRoots: ["/repo/app"], environments: [], additionalContext: { a: { text: "keep" } } } });
   engine.processClientMessage({ id: "live-reviewer", method: "turn/settings/update", params: { threadId: "main", turnId: "old-turn", approvalsReviewer: "user" } });
   engine.processServerMessage({ id: "live-reviewer", result: { status: "applied" } });
   engine.processServerMessage({ method: "thread/settings/updated", params: { threadId: "main", threadSettings: {
@@ -573,30 +569,32 @@ test("続行では古い権限を再送せず、最新の作業モードとタ�
   assert.deepEqual(continuation.params.additionalContext, { a: { text: "keep" } });
   assert.deepEqual(continuation.params.outputSchema, { type: "object" });
   assert.equal(continuation.params.approvalsReviewer, "user");
+  assert.deepEqual({ method: settings.method, model: continuation.params.model, effort: continuation.params.effort,
+    modeModel: continuation.params.collaborationMode.settings.model, modeEffort: continuation.params.collaborationMode.settings.reasoning_effort,
+    input: continuation.params.input, tool: continuation.params.toolOutput.name, userMessage: continuation.params.clientUserMessageId },
+  { method: "thread/settings/update", model: "gpt-6-astra", effort: "high", modeModel: "gpt-6-astra", modeEffort: "high",
+    input: [], tool: "switch_model", userMessage: undefined });
+  assert.equal(diagnostics.events.some(e => e.event === "switch-accepted"), false);
+  engine.processServerMessage({ id: continuation.id, result: { turn: { id: "new-turn", status: "inProgress" } } });
+  assert.equal(diagnostics.events.at(-1).event, "switch-accepted");
 });
 
-test("理由なしの変更は完了通知を待って同じタスクを新モデルで続行し、権限・指示を維持する", () => {
+test.each(["settings", "continue", "timeout", "invalid", "cancel"])("内部中断後に%sで続行できなければ終了通知を戻す", (failure) => {
   const { engine, call, diagnostics } = beginSwitchTest();
-  const interrupt = switch_model(engine, call);
-  assert.equal(interrupt.upstream[0].method, "turn/interrupt");
-  assert.equal(engine.processServerMessage({ id: interrupt.upstream[0].id, result: {} }).upstream.length, 0);
-  const completed = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } });
-  const settings = completed.upstream[0];
-  assert.equal(settings.method, "thread/settings/update");
-  const continued = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
-  assert.deepEqual({
-    method: continued.method, task: continued.params.threadId, input: continued.params.input,
-    model: continued.params.model, effort: continued.params.effort,
-    mode: continued.params.collaborationMode, approval: continued.params.approvalPolicy,
-    sandbox: continued.params.sandboxPolicy, schema: continued.params.outputSchema,
-    tool: continued.params.toolOutput.name, userMessage: continued.params.clientUserMessageId,
-  }, { method: "turn/start", task: "main", input: [], model: "gpt-6-astra", effort: "high",
-    mode: { mode: "default", settings: { model: "gpt-6-astra", reasoning_effort: "high", developer_instructions: "keep mode instructions" } },
-    approval: undefined, sandbox: undefined, schema: { type: "object" },
-    tool: "switch_model", userMessage: undefined });
-  assert.equal(diagnostics.events.some((entry) => entry.event === "switch-accepted"), false);
-  engine.processServerMessage({ id: continued.id, result: { turn: { id: "new-turn", status: "inProgress" } } });
-  assert.equal(diagnostics.events.at(-1).event, "switch-accepted");
+  const interrupt = switch_model(engine, call).upstream[0];
+  const completed = { method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } };
+  assert.equal(engine.processServerMessage(completed).upstream.length, 0, "通知が先でも中断応答を待つ");
+  const settings = engine.processServerMessage({ id: interrupt.id, result: {} }).upstream[0];
+  const request = failure === "settings" ? settings : engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
+  if (failure === "cancel") engine.processClientMessage({ id: "stop", method: "turn/interrupt", params: { threadId: "main", turnId: "old-turn" } });
+  const reply = failure === "invalid" || failure === "cancel" ? { id: request.id, result: {} }
+    : { id: request.id, error: { code: -1, message: failure === "timeout" ? "baton: turn/start timed out" : "refused" } };
+  const result = engine.processServerMessage(reply);
+  assert.deepEqual(result.downstream.at(-1), completed, "続行できない場合は実際の中断を隠さない");
+  if (failure !== "cancel") assert.equal(result.downstream[0].method, "error");
+  if (reply.error) assert.ok(result.downstream[0].params.error.message.includes(reply.error.message));
+  assert.equal(diagnostics.events.some(e => e.event === "switch-accepted"), false);
+  if (failure === "continue") assert.equal(engine.processServerMessage({ id: request.id, result: {} }).consume, true);
 });
 
 test("effort欠落、不正指定、利用不能モデル、古いターン、子を中断しない", () => {
@@ -619,41 +617,25 @@ test("effort欠落、不正指定、利用不能モデル、古いターン、�
 test("並行ツールや承認待ちがある間は変更を拒否し、通常の承認応答は透過する", () => {
   const { engine, call } = beginSwitchTest();
   const approval = { id: 8, method: "item/commandExecution/requestApproval", params: { threadId: "main", turnId: "old-turn" } };
-  engine.processServerMessage(approval);
+  assert.equal(engine.processServerMessage(approval), undefined);
   assert.equal(switch_model(engine, call).upstream[0].result.success, false);
   const response = { id: 8, result: { decision: "decline" } };
-  assert.equal(engine.processClientMessage(response).message, response);
+  assert.deepEqual(engine.processClientMessage(response), { type: "forward", message: response, modified: false });
   engine.processServerMessage({ method: "item/started", params: { threadId: "main", turnId: "old-turn", item: { id: "command", type: "commandExecution" } } });
   assert.equal(switch_model(engine, call).upstream[0].result.success, false);
   engine.processServerMessage({ method: "item/completed", params: { threadId: "main", turnId: "old-turn", item: { id: "command", type: "commandExecution" } } });
   assert.equal(switch_model(engine, call).upstream[0].method, "turn/interrupt");
 });
 
-test("停止・新しいユーザー入力・重複完了は自動続行を増殖させない", () => {
+test("停止・新しいユーザー入力は切り替えを取り消し、自動続行しない", () => {
   for (const method of ["turn/interrupt", "turn/start", "turn/steer", "thread/archive"]) {
     const { engine, call } = beginSwitchTest();
     switch_model(engine, call);
     engine.processClientMessage({ id: "user", method, params: { threadId: "main", turnId: "old-turn", input: [{ type: "text", text: "stop/change" }] } });
     const result = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } });
     assert.equal(result?.upstream?.length ?? 0, 0);
+    assert.notEqual(result?.consume, true, "利用者の取消による中断は通知する");
   }
-  const { engine, call } = beginSwitchTest();
-  const interrupt = switch_model(engine, call).upstream[0];
-  const event = { method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } };
-  engine.processServerMessage({ id: interrupt.id, result: {} });
-  engine.processServerMessage(event);
-  assert.equal(engine.processServerMessage(event)?.upstream?.length ?? 0, 0);
-});
-
-test("中断や開始失敗を成功扱いせず別タスクを変更しない", () => {
-  const { engine, call, diagnostics } = beginSwitchTest();
-  announceThread(engine, "other", { model: "gpt-5.6-sol" });
-  const before = structuredClone(engine.threads.other);
-  const interrupt = switch_model(engine, call).upstream[0];
-  const failed = engine.processServerMessage({ id: interrupt.id, error: { code: -1, message: "cannot interrupt" } });
-  assert.equal(failed.upstream[0].result.success, false);
-  assert.deepEqual(engine.threads.other, before);
-  assert.equal(diagnostics.events.some((entry) => entry.event === "switch-accepted"), false);
 });
 
 test("同じリポジトリのAだけをAstraへ変更し、Bの実行・承認・次の応答をSolのまま保つ", () => {
@@ -723,45 +705,24 @@ test("再接続はCodexが返すモデルを使い、旧固定値や他プロセ
   assert.deepEqual(engine.processClientMessage(request), { type: "forward", message: request, modified: false });
 });
 
-test("続行の開始が停止と競合したら、新しく受理された区間も停止する", () => {
+test.each(["user-stop", "timeout"])("取消後に遅れて受理された続行も停止し、成功扱いしない: %s", (reason) => {
   const { engine, call, diagnostics } = beginSwitchTest();
   const interrupt = switch_model(engine, call).upstream[0];
   engine.processServerMessage({ id: interrupt.id, result: {} });
   const settings = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } }).upstream[0];
   const continuation = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
-  engine.processClientMessage({ id: 999, method: "turn/interrupt", params: { threadId: "main", turnId: "old-turn" } });
+  if (reason === "user-stop") {
+    engine.processClientMessage({ id: 999, method: "turn/interrupt", params: { threadId: "main", turnId: "old-turn" } });
+  } else {
+    const timeout = engine.processServerMessage({ id: continuation.id, error: { code: -32091, message: "baton: turn/start timed out" } });
+    assert.match(timeout.downstream[0].params.error.message, /timed out/);
+  }
   const result = engine.processServerMessage({ id: continuation.id, result: { turn: { id: "late-turn", status: "inProgress" } } });
   assert.deepEqual(result.upstream[0]?.params, { threadId: "main", turnId: "late-turn" });
   assert.equal(diagnostics.events.some((entry) => entry.event === "switch-accepted"), false);
 });
 
-test("完了通知が応答より先でも一度だけ続行し、開始失敗を利用者へ知らせる", () => {
-  const { engine, call, diagnostics } = beginSwitchTest();
-  const interrupt = switch_model(engine, call).upstream[0];
-  const completed = { method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } };
-  assert.equal(engine.processServerMessage(completed).upstream.length, 0);
-  const settings = engine.processServerMessage({ id: interrupt.id, result: {} }).upstream[0];
-  const continuation = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
-  const failed = engine.processServerMessage({ id: continuation.id, error: { code: -1, message: "start refused" } });
-  assert.match(failed.downstream[0].params.error.message, /start refused/);
-  assert.equal(diagnostics.events.some((entry) => entry.event === "switch-accepted"), false);
-  assert.equal(engine.processServerMessage({ id: continuation.id, result: {} }).consume, true);
-});
-
-test("開始タイムアウト後に届く遅い成功も停止し、裏で実行を続けない", () => {
-  const { engine, call, diagnostics } = beginSwitchTest();
-  const interrupt = switch_model(engine, call).upstream[0];
-  engine.processServerMessage({ id: interrupt.id, result: {} });
-  const settings = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } }).upstream[0];
-  const continuation = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
-  const timeout = engine.processServerMessage({ id: continuation.id, error: { code: -32091, message: "baton: turn/start timed out" } });
-  assert.match(timeout.downstream[0].params.error.message, /timed out/);
-  const late = engine.processServerMessage({ id: continuation.id, result: { turn: { id: "late-turn", status: "inProgress" } } });
-  assert.deepEqual(late.upstream[0]?.params, { threadId: "main", turnId: "late-turn" });
-  assert.equal(diagnostics.events.some((entry) => entry.event === "switch-accepted"), false);
-});
-
-test("中断受付後に完了通知が失われても待ち続けず失敗を返す", async () => {
+test.each([false, true, "tool"])("切り替え要求タイマーは通知欠落で失敗し、成功後は残らない（待機ケース=%s）", async (completeSwitch) => {
   const temporary = mkdtempSync(path.join(tmpdir(), "baton-timeout-"));
   const fakeCodex = path.join(temporary, "codex");
   writeFileSync(fakeCodex, `#!/usr/bin/env node
@@ -775,12 +736,26 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   if (m.method === "model/list") send({ id: m.id, result: { data: ["gpt-5.6-sol", "gpt-6-astra"].map(model => ({ model, supportedReasoningEfforts: [{ reasoningEffort: "high" }] })), nextCursor: null } });
   if (m.method === "thread/start") send({ id: m.id, result: { thread: { id: "main", parentThreadId: null, cwd: ${JSON.stringify(repository)}, model: "gpt-5.6-sol", status: { type: "idle" } } } });
   if (m.method === "turn/start") {
+    if (m.params.toolOutput) {
+      send({ id: m.id, result: { turn: { id: "continued", status: "inProgress" } } });
+      send({ method: "turn/started", params: { threadId: "main", turn: { id: "continued", status: "inProgress" } } });
+      send({ method: "test/ready" });
+      return;
+    }
     send({ id: m.id, result: { turn: { id: "turn", status: "inProgress" } } });
     send({ id: "switch", method: "item/tool/call", params: { threadId: "main", turnId: "turn", callId: "switch", namespace: null, tool: "switch_model", arguments: { model: "gpt-6-astra", config: { effort: "high" } } } });
   }
   if (m.method === "thread/backgroundTerminals/list") send({ id: m.id, result: { data: [], nextCursor: null } });
-  if (m.method === "turn/interrupt") { send({ id: m.id, result: {} }); send({ method: "test/ready" }); }
-  if (!m.method && m.id === "switch") send({ method: "test/result", params: m.result });
+  if (m.method === "turn/interrupt") {
+    send({ id: m.id, result: {} });
+    if (${JSON.stringify(completeSwitch)} === true) send({ method: "turn/completed", params: { threadId: "main", turn: { id: "turn", status: "interrupted" } } });
+    else send({ method: "test/ready" });
+  }
+  if (m.method === "thread/settings/update") send({ id: m.id, result: {} });
+  if (!m.method && m.id === "switch") {
+    if (${JSON.stringify(completeSwitch)} === "tool") send({ method: "test/ready" });
+    else send({ method: "item/completed", params: { threadId: "main", turnId: "turn", item: { id: "switch", type: "dynamicToolCall", status: "completed", success: m.result.success } } });
+  }
 });
 `);
   chmodSync(fakeCodex, 0o755);
@@ -795,7 +770,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     if (message.id === 1) input.write(JSON.stringify({ id: 2, method: "thread/start", params: { cwd: repository } }) + "\n");
     if (message.id === 2) input.write(JSON.stringify(turnRequest(3, "main", { model: "gpt-5.6-sol", effort: "high" })) + "\n");
     if (message.method === "test/ready") ready();
-    if (message.method === "test/result") finish(message.params);
+    if (message.method === "error") finish(message.params.error);
   } });
   output.on("data", (chunk) => lines.push(chunk));
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -805,8 +780,15 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     input.write(JSON.stringify({ id: 1, method: "initialize", params: {} }) + "\n");
     await readyPromise;
     await vi.advanceTimersByTimeAsync(30_001);
-    const result = await resultPromise;
-    assert.deepEqual({ success: result.success, timedOut: result.contentItems[0].text.includes("timed out") }, { success: false, timedOut: true });
+    if (completeSwitch !== true) {
+      const result = await resultPromise;
+      assert.match(result.message, /timed out/);
+    }
+    const events = readFileSync(path.join(temporary, "router.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+    assert.equal(events.filter(e => e.event === "switch-request-timeout").length, completeSwitch === true ? 0 : 1);
+    assert.equal(events.filter(e => e.event === "switch-accepted").length, completeSwitch === true ? 1 : 0);
+    assert.equal(events.filter(e => e.event === "control-request" && e.source === "baton" && e.method === "turn/interrupt").length, completeSwitch === "tool" ? 0 : 1);
+    assert.equal(events.filter(e => e.event === "control-request" && e.source === "client" && e.method === "turn/start").length, 1);
   } finally {
     input.end();
     await exited;
@@ -928,22 +910,6 @@ test("切り替えを無効化したエンジンは要求を書き換えない",
   assert.equal(action.message, request);
 });
 
-test("承認要求と応答を双方向にそのまま中継する", () => {
-  const { engine } = makeEngine();
-  const approval = {
-    method: "item/commandExecution/requestApproval",
-    id: "server-request-1",
-    params: { threadId: "thread-1", turnId: "turn-1", command: "npm test" },
-  };
-  assert.equal(engine.processServerMessage(approval), undefined);
-  const response = { id: "server-request-1", result: { decision: "accept" } };
-  assert.deepEqual(engine.processClientMessage(response), {
-    type: "forward",
-    message: response,
-    modified: false,
-  });
-});
-
 test("処理中の要求ID重複を拒否する", () => {
   const { engine } = makeEngine();
   announceThread(engine, "thread-1");
@@ -972,16 +938,18 @@ test("不要なモデル定義の内容に起動可否が依存しない", () =>
   assert.throws(() => makeConfig({ efforts: { "gpt-5.6-sol": "high" } }), /removed/);
 });
 
-test("選択モデルの追加項目を型変換せずCodexの続行要求へまとめて渡す", () => {
+test("起動設定のモデル定義を使わず、呼び出し側の設定を同期・続行へそのまま渡す", () => {
   const extra = { summary: "concise", personality: "friendly", serviceTier: null, outputSchema: { type: "object", properties: { answer: { type: "string" } } } };
-  const config = makeConfig();
+  const config = makeConfig({ models: { "gpt-6-astra": { effort: "high", personality: "pragmatic", serviceTier: "default" } } });
   const { engine, call } = beginSwitchTest({ config });
-  call.params.arguments.config = { effort: "high", ...extra };
+  call.params.arguments.config = { effort: "xhigh", ...extra };
   const before = structuredClone(config);
   const interrupt = switch_model(engine, call).upstream[0];
   engine.processServerMessage({ id: interrupt.id, result: {} });
   const settings = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } }).upstream[0];
   const continuation = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
+  assert.deepEqual([settings.params.effort, settings.params.collaborationMode.settings.reasoning_effort, continuation.params.effort],
+    ["xhigh", "xhigh", "xhigh"]);
   assert.deepEqual({
     extra: Object.fromEntries(Object.keys(extra).map((key) => [key, continuation.params[key]])),
     threadId: continuation.params.threadId, model: continuation.params.model, input: continuation.params.input,
@@ -1070,7 +1038,7 @@ require("node:fs").writeFileSync(process.env.CODEX_AUTO_CAPTURE_PATH, process.ar
   ]);
 });
 
-test("サブコマンドなしでCLI版をカレントディレクトリのルーターへ接続する", () => {
+test.each([0, 23])("CLI版は接続先を渡し、終了コードを保持してsocketを片付ける: %s", (cliExitCode) => {
   const temporary = mkdtempSync(path.join(tmpdir(), "baton-cli-"));
   const fakeCodex = path.join(temporary, "codex");
   const capturePath = path.join(temporary, "arguments.txt");
@@ -1081,7 +1049,7 @@ test("サブコマンドなしでCLI版をカレントディレクトリのル�
 ${schemaCommand}
 if (process.argv[2] === "--version") { console.log("codex-cli 0.153.4"); process.exit(0); }
 if (process.argv[2] === "app-server") { process.stdin.resume(); }
-else require("node:fs").writeFileSync(process.env.CODEX_AUTO_CAPTURE_PATH, process.argv.slice(2).join("\\n"));
+else { require("node:fs").writeFileSync(process.env.CODEX_AUTO_CAPTURE_PATH, process.argv.slice(2).join("\\n")); process.exit(${cliExitCode}); }
 `,
   );
   chmodSync(fakeCodex, 0o755);
@@ -1103,11 +1071,59 @@ else require("node:fs").writeFileSync(process.env.CODEX_AUTO_CAPTURE_PATH, proce
     timeout: 10_000,
   });
 
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, cliExitCode, result.stderr);
   const argumentsList = readFileSync(capturePath, "utf8").trim().split("\n");
   assert.equal(argumentsList[0], "--remote");
   assert.match(argumentsList[1], /^unix:\/\//u);
   assert.deepEqual(argumentsList.slice(2), ["-C", repositoryRoot, "--search"]);
+  const diagnostics = readFileSync(path.join(temporary, "state/router.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(diagnostics.find(e => e.event === "cli-exit")?.code, cliExitCode);
+  assert.equal(existsSync(argumentsList[1].slice("unix://".length)), false, "CLI終了時は現在の仕様どおりsocketが片付く");
+});
+
+test.each([false, true])("CLIではサーバー標準エラーだけを保存し、通常のエラー通知とCLI出力を維持する: %s", (cli) => {
+  const log = "ERROR codex_core::tools::router: error=dynamic tool call was cancelled before receiving a response\n";
+  const { run, configPath } = compatibilityFixture({ script: `
+if (process.argv[2] === "app-server" && process.argv[3] !== "generate-json-schema") {
+  process.stderr.write(${JSON.stringify(log)});
+  console.log(JSON.stringify({ method: "error", params: { threadId: "test", turnId: "turn", willRetry: false,
+    error: { message: "VISIBLE_RPC_ERROR", codexErrorInfo: null, additionalDetails: null } } }));
+  console.log(JSON.stringify({ method: "test/ready" }));
+  process.stdin.resume();
+  return;
+}
+if (process.argv[2] === "--remote") {
+  const socket = require("node:net").connect(process.argv[3].slice("unix://".length));
+  const timeout = setTimeout(() => process.exit(99), 5000);
+  let received = "";
+  let ready = false;
+  socket.on("connect", () => socket.write("GET / HTTP/1.1\\r\\nHost: localhost\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\nSec-WebSocket-Version: 13\\r\\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\\r\\n\\r\\n"));
+  socket.on("data", chunk => {
+    received += chunk.toString();
+    if (ready || !received.includes("test/ready")) return;
+    ready = true;
+    require("node:assert/strict").ok(received.includes("VISIBLE_RPC_ERROR"));
+    console.log("CLI_READY");
+    process.stderr.write("CLI_STDERR\\n");
+    clearTimeout(timeout);
+    socket.end();
+  });
+  return;
+}
+` });
+  const result = run(cli ? [] : ["app-server", "--listen", "stdio://"], cli);
+  assert.equal(result.status, 0, result.stderr);
+  const logPath = path.join(path.dirname(configPath), "app-server.stderr.log");
+  if (cli) {
+    assert.equal(result.stdout, "CLI_READY\n");
+    assert.equal(result.stderr, "CLI_STDERR\n", "サーバー内部ログは端末へ混ぜない");
+    assert.equal(readFileSync(logPath, "utf8"), log, "文言で捨てず原文を保存する");
+    assert.equal(statSync(logPath).mode & 0o777, 0o600);
+  } else {
+    assert.equal(result.stderr, log, "既存のstdio接続では標準エラーを維持する");
+    assert.match(result.stdout, /VISIBLE_RPC_ERROR/);
+    assert.equal(existsSync(logPath), false);
+  }
 });
 
 test("設定ファイル内の行コメントを許可する", () => {
