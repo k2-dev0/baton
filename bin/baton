@@ -64,6 +64,7 @@ run_cli() {
   set +e
   CODEX_CLI_PATH= "$launcher_path" --remote "unix://$socket_path" -C "$workspace" "$@"
   cli_status=$?
+  CODEX_BATON_INNER_CODEX=$launcher_path "$proxy_path" --router-cli-exit "$cli_status"
   set -e
   exit "$cli_status"
 }
