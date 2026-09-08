@@ -25,7 +25,7 @@ const DEFAULT_STATE_DIR = path.join(
   homedir(),
   "Library",
   "Application Support",
-  "codex-model-router",
+  "codex-baton",
 );
 
 // 未検証のJSON値を、配列を除くオブジェクトとして判定する。
@@ -188,7 +188,7 @@ export class RouterEngine {
     if (hasRequestId(message) && !message.method) this.serverRequests.delete(requestKey(message.id));
     if (typeof message.method !== "string") return { type: "forward", message, modified: false };
     if (hasRequestId(message) && (this.pending.has(requestKey(message.id)) ||
-        (typeof message.id === "string" && message.id.startsWith("model-router:switch:")))) {
+        (typeof message.id === "string" && message.id.startsWith("baton:switch:")))) {
       return { type: "local-error", message: this.#localError(message.id, "duplicate or reserved in-flight request id") };
     }
     if (message.method === "initialize" && this.compatible) {
@@ -253,7 +253,7 @@ export class RouterEngine {
       const key = requestKey(message.id);
       const pending = this.pending.get(key);
       if (pending?.kind === "switch") return this.switch_model(message);
-      if (typeof message.id === "string" && message.id.startsWith("model-router:switch:")) {
+      if (typeof message.id === "string" && message.id.startsWith("baton:switch:")) {
         return { consume: true, upstream: [], downstream: [] };
       }
       if (pending) {
@@ -349,7 +349,7 @@ export class RouterEngine {
       if (message.error) {
         this.switches.delete(threadId);
         this.diagnostics.record("switch-failed", { threadId, phase: state.phase, error: message.error.message });
-        if (state.phase === "continue" && message.error.message === "model-router: turn/start timed out") {
+        if (state.phase === "continue" && message.error.message === "baton: turn/start timed out") {
           state.cancelled = true;
           this.switches.set(threadId, state);
           this.pending.set(requestKey(message.id), pending);
@@ -368,7 +368,7 @@ export class RouterEngine {
           contentItems: [{ type: "inputText", text: "Model switch cancelled by a user operation." }] } });
         if (state.phase === "continue" && message.result?.turn?.status === "inProgress") {
           state.phase = "cancel";
-          const id = "model-router:switch:" + randomUUID();
+          const id = "baton:switch:" + randomUUID();
           this.pending.set(requestKey(id), { kind: "switch", threadId });
           action.upstream.push({ id, method: "turn/interrupt", params: { threadId, turnId: message.result.turn.id } });
           return action;
@@ -409,7 +409,7 @@ export class RouterEngine {
         return action;
       }
     }
-    const id = "model-router:switch:" + randomUUID();
+    const id = "baton:switch:" + randomUUID();
     if (state.requestId) this.pending.delete(requestKey(state.requestId));
     state.requestId = id;
     let method = "turn/interrupt";
@@ -435,10 +435,10 @@ export class RouterEngine {
       params = applySelection({ params }, state).params;
       delete params.clientUserMessageId;
       params.input = [];
-      params.turnTrigger = "model-router";
+      params.turnTrigger = "baton";
       params.toolOutput = { name: "switch_model", output: JSON.stringify({
         model: state.model, config: state.settings, status: "applied",
-        message: "Continue the original task from this successful switch; do not repeat completed work. The preceding interruption was performed by model-router, not the user.",
+        message: "Continue the original task from this successful switch; do not repeat completed work. The preceding interruption was performed by baton, not the user.",
       }) };
     }
     this.pending.set(requestKey(id), { kind: "switch", threadId, params: cloneJson(params) });
@@ -450,17 +450,17 @@ export class RouterEngine {
     if (!this.modelCatalog) {
       return {
         code: "model-catalog-unavailable",
-        message: `model router cannot verify model availability${this.catalogError ? `: ${this.catalogError}` : ""}`,
+        message: `baton cannot verify model availability${this.catalogError ? `: ${this.catalogError}` : ""}`,
       };
     }
     const efforts = this.modelCatalog.get(model);
     if (!efforts) {
-      return { code: "model-unavailable", message: `model router: ${model} is not available` };
+      return { code: "model-unavailable", message: `baton: ${model} is not available` };
     }
     if (effort && !efforts.has(effort)) {
       return {
         code: "effort-unavailable",
-        message: `model router: ${model} does not advertise reasoning effort ${effort}`,
+        message: `baton: ${model} does not advertise reasoning effort ${effort}`,
       };
     }
     return null;
@@ -536,7 +536,7 @@ function parseConfigFile(contents) {
 }
 
 // 設定ファイルを読み取り、外部入力のまま判定処理へ渡さない。
-function loadConfig(configPath = process.env.CODEX_MODEL_ROUTER_CONFIG ?? DEFAULT_CONFIG_PATH) {
+function loadConfig(configPath = process.env.CODEX_BATON_CONFIG ?? DEFAULT_CONFIG_PATH) {
   return validateConfig(parseConfigFile(readFileSync(configPath, "utf8")));
 }
 
@@ -544,7 +544,7 @@ function loadConfig(configPath = process.env.CODEX_MODEL_ROUTER_CONFIG ?? DEFAUL
 function resolveInnerCodex(config) {
   const resourcesPath = process.env.CODEX_ELECTRON_RESOURCES_PATH;
   const candidate =
-    process.env.CODEX_MODEL_ROUTER_INNER_CODEX ??
+    process.env.CODEX_BATON_INNER_CODEX ??
     (resourcesPath ? path.join(resourcesPath, "codex") : null) ??
     config.innerCodexPath;
   const resolved = path.resolve(candidate);
@@ -583,7 +583,7 @@ function runPassthrough(innerCodexPath, args) {
     stdio: "inherit",
   });
   child.on("error", (error) => {
-    process.stderr.write(`codex-model-router: ${error.message}\n`);
+    process.stderr.write(`codex-baton: ${error.message}\n`);
     process.exitCode = 70;
   });
   child.on("exit", (code, signal) => {
@@ -641,7 +641,7 @@ export function runAppServerProxy({
     if (failed) return;
     failed = true;
     diagnostics.record("proxy-failure", { reason: error.message });
-    process.stderr.write(`codex-model-router: ${error.message}\n`);
+    process.stderr.write(`codex-baton: ${error.message}\n`);
     process.exitCode = 70;
     child.kill("SIGTERM");
     child.stdin.destroy();
@@ -685,7 +685,7 @@ export function runAppServerProxy({
   const beginCatalogGate = () => {
     if (gate.finished || gate.internalId !== null) return;
     let id;
-    do id = `codex-model-router:${randomUUID()}`;
+    do id = `codex-baton:${randomUUID()}`;
     while (activeClientRequestIds.has(requestKey(id)));
     gate.internalId = id;
     requestCatalogPage();
@@ -771,7 +771,7 @@ export function runAppServerProxy({
           writeRespectingBackpressure(child.stdin, JSON.stringify(outgoing) + "\n", clientReadable);
           if (outgoing.method) switchTimers.set(outgoing.id, setTimeout(() => {
             serverDecoder.onLine(JSON.stringify({ id: outgoing.id, error: {
-              code: -32091, message: "model-router: " + outgoing.method + " timed out",
+              code: -32091, message: "baton: " + outgoing.method + " timed out",
             } }));
           }, SWITCH_REQUEST_TIMEOUT_MS));
         }
@@ -882,7 +882,7 @@ export function runCliWebSocketProxy({ config, innerCodexPath, listenUrl, stateD
     },
   });
   server.on("error", (error) => {
-    process.stderr.write(`codex-model-router: ${error.message}\n`);
+    process.stderr.write(`codex-baton: ${error.message}\n`);
     process.exitCode = 70;
   });
 }
@@ -896,7 +896,7 @@ function printCheck(config, innerCodexPath) {
     enabledRepositories: config.enabledRepositories,
   };
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-  if (!result.ok) process.stderr.write(`codex-model-router: incompatible Codex: ${result.reason}\n`);
+  if (!result.ok) process.stderr.write(`codex-baton: incompatible Codex: ${result.reason}\n`);
   process.exitCode = result.ok ? 0 : 2;
 }
 
@@ -911,7 +911,7 @@ export function main(args = process.argv.slice(2)) {
   if (args[0] === "--router-listen") {
     if (args.length !== 2) throw new Error("--router-listen requires one unix:// URL");
     const stateDirectory =
-      process.env.CODEX_MODEL_ROUTER_STATE_DIR ?? config.stateDirectory ?? DEFAULT_STATE_DIR;
+      process.env.CODEX_BATON_STATE_DIR ?? config.stateDirectory ?? DEFAULT_STATE_DIR;
     runCliWebSocketProxy({ config, innerCodexPath, listenUrl: args[1], stateDirectory });
     return;
   }
@@ -920,7 +920,7 @@ export function main(args = process.argv.slice(2)) {
     return;
   }
   const stateDirectory =
-    process.env.CODEX_MODEL_ROUTER_STATE_DIR ?? config.stateDirectory ?? DEFAULT_STATE_DIR;
+    process.env.CODEX_BATON_STATE_DIR ?? config.stateDirectory ?? DEFAULT_STATE_DIR;
   runAppServerProxy({ config, innerCodexPath, args, stateDirectory });
 }
 
@@ -928,7 +928,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   try {
     main();
   } catch (error) {
-    process.stderr.write(`codex-model-router: ${error.message}\n`);
+    process.stderr.write(`codex-baton: ${error.message}\n`);
     process.exitCode = 70;
   }
 }

@@ -1,4 +1,4 @@
-# model-router
+# baton
 
 メインエージェントが同じタスクの途中で自律的にモデルを切り替えて作業を自動続行するローカル中継
 
@@ -7,19 +7,19 @@
 起動したいディレクトリに移動して起動する
 
 ```sh
-cd /Users/[user_name]/[directory] /Users/[user_name]/model-router/bin/model-router
+cd /Users/[user_name]/[directory] /Users/[user_name]/baton/bin/baton
 ```
 
 カレントディレクトリで起動したい場合は `cd` を省略する
 
 ```sh
-/Users/[user_name]/model-router/bin/model-router
+/Users/[user_name]/baton/bin/baton
 ```
 
 `app` オプションをつけるとデスクトップアプリと中継機能が起動する
 
 ```sh
-/Users/[user_name]/model-router/bin/model-router app
+/Users/[user_name]/baton/bin/baton app
 ```
 
 ## 設定
@@ -75,7 +75,7 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/model-router/bin/model-rout
     "summary": "concise"
   },
   "status": "applied",
-  "message": "Continue the original task from this successful switch; do not repeat completed work. The preceding interruption was performed by model-router, not the user."
+  "message": "Continue the original task from this successful switch; do not repeat completed work. The preceding interruption was performed by baton, not the user."
 }
 ```
 
@@ -136,14 +136,14 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/model-router/bin/model-rout
 ## 記録と検証
 
 - タスク・適用モデルの永続化はエージェント本体に任せる
-- 診断ログは `~/Library/Application Support/codex-model-router/router.jsonl`
-- `CODEX_MODEL_ROUTER_CONFIG`、`CODEX_MODEL_ROUTER_STATE_DIR`、`CODEX_MODEL_ROUTER_INNER_CODEX` で試験用の設定・保存先・実行ファイルを指定できる
+- 診断ログは `~/Library/Application Support/codex-baton/router.jsonl`
+- `CODEX_BATON_CONFIG`、`CODEX_BATON_STATE_DIR`、`CODEX_BATON_INNER_CODEX` で試験用の設定・保存先・実行ファイルを指定できる
 
 ```sh
 npm test
 npm run check
 # インストール済みCodexの通信仕様を確認（推論なし）
-./bin/model-router check
+./bin/baton check
 # 実際のモデルを使用し、利用枠を消費する試験
-MODEL_ROUTER_LIVE=1 npm test -- -t '実機で同一タスク'
+BATON_LIVE=1 npm test -- -t '実機で同一タスク'
 ```

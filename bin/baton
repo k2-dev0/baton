@@ -13,16 +13,16 @@ fi
 
 usage() {
   printf '%s\n' \
-    "Usage: model-router app [WORKSPACE]" \
-    "       model-router [CODEX_OPTIONS...]" \
-    "       model-router check"
+    "Usage: baton app [WORKSPACE]" \
+    "       baton [CODEX_OPTIONS...]" \
+    "       baton check"
 }
 
 # サブコマンドなしの引数をCodex CLIへそのまま渡す。
 run_cli() {
   workspace=$(pwd -P)
   runtime_parent=${TMPDIR:-/tmp}
-  runtime_dir=$(mktemp -d "$runtime_parent/codex-model-router.XXXXXX")
+  runtime_dir=$(mktemp -d "$runtime_parent/codex-baton.XXXXXX")
   socket_path="$runtime_dir/app-server.sock"
   proxy_pid=""
 
@@ -38,24 +38,24 @@ run_cli() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
-  if ! CODEX_MODEL_ROUTER_INNER_CODEX=$launcher_path "$proxy_path" --router-check >/dev/null; then
-    printf '%s\n' "model-router: router compatibility check failed; CLI was not started" >&2
+  if ! CODEX_BATON_INNER_CODEX=$launcher_path "$proxy_path" --router-check >/dev/null; then
+    printf '%s\n' "baton: router compatibility check failed; CLI was not started" >&2
     exit 78
   fi
 
-  CODEX_MODEL_ROUTER_INNER_CODEX=$launcher_path \
+  CODEX_BATON_INNER_CODEX=$launcher_path \
     "$proxy_path" --router-listen "unix://$socket_path" &
   proxy_pid=$!
   attempt=0
   while [ ! -S "$socket_path" ]; do
     if ! kill -0 "$proxy_pid" >/dev/null 2>&1; then
       wait "$proxy_pid" 2>/dev/null || true
-      printf '%s\n' "model-router: CLI router stopped before accepting connections" >&2
+      printf '%s\n' "baton: CLI router stopped before accepting connections" >&2
       exit 70
     fi
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 100 ]; then
-      printf '%s\n' "model-router: timed out waiting for the CLI router" >&2
+      printf '%s\n' "baton: timed out waiting for the CLI router" >&2
       exit 70
     fi
     sleep 0.05
@@ -69,7 +69,7 @@ run_cli() {
 }
 
 if [ -z "$launcher_path" ]; then
-  printf '%s\n' "model-router: codex command was not found" >&2
+  printf '%s\n' "baton: codex command was not found" >&2
   exit 69
 fi
 
@@ -89,7 +89,7 @@ case "$command_name" in
     fi
     workspace=${2:-.}
     if [ ! -d "$workspace" ]; then
-      printf '%s\n' "model-router: workspace is not a directory: $workspace" >&2
+      printf '%s\n' "baton: workspace is not a directory: $workspace" >&2
       exit 66
     fi
     workspace=$(CDPATH= cd -- "$workspace" && pwd -P)
@@ -118,25 +118,25 @@ case "$desktop_status" in
       0) exec "$launcher_path" app "$workspace" ;;
       1)
         printf '%s\n' \
-          "model-router: ChatGPT Desktop is already running without the model router." \
+          "baton: ChatGPT Desktop is already running without baton." \
           "Running tasks were not interrupted. Quit Desktop manually, then run this command again." >&2
         exit 73
         ;;
       *)
-        printf '%s\n' "model-router: cannot inspect Desktop process state; Desktop was not started" >&2
+        printf '%s\n' "baton: cannot inspect Desktop process state; Desktop was not started" >&2
         exit 69
         ;;
     esac
     ;;
   1) ;;
   *)
-    printf '%s\n' "model-router: cannot inspect Desktop process state; Desktop was not started" >&2
+    printf '%s\n' "baton: cannot inspect Desktop process state; Desktop was not started" >&2
     exit 69
     ;;
 esac
 
 if ! "$proxy_path" --router-check >/dev/null; then
-  printf '%s\n' "model-router: router compatibility check failed; Desktop was not started" >&2
+  printf '%s\n' "baton: router compatibility check failed; Desktop was not started" >&2
   exit 78
 fi
 

@@ -128,7 +128,7 @@ export function checkCliCompatibility(innerCodexPath) {
   const cliVersion = version.status === 0 ? `${version.stdout}\n${version.stderr}`.match(/codex-cli\s+(\S+)/)?.[1] ?? null : null;
   let temporary;
   try {
-    temporary = mkdtempSync(path.join(tmpdir(), "model-router-schema-"));
+    temporary = mkdtempSync(path.join(tmpdir(), "baton-schema-"));
     const result = spawnSync(innerCodexPath, ["app-server", "generate-json-schema", "--experimental", "--out", temporary], options);
     if (result.error?.code === "ETIMEDOUT") throw new Error(`protocol schema generation timed out after ${PROBE_TIMEOUT_MS}ms`);
     if (result.error || result.status !== 0) throw new Error(`protocol schema generation failed: ${result.error?.message ?? `exit ${result.status}; ${result.stderr.trim()}`}`);

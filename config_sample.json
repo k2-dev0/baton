@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "enabledRepositories": [
     // モデル切り替えを行うプロジェクトを追加する
-    "/Users/[user_name]/model-router"
+    "/Users/[user_name]/baton"
   ],
   "innerCodexPath": "/Applications/ChatGPT.app/Contents/Resources/codex",
   "desktopAppPath": "/Applications/ChatGPT.app",

@@ -1,11 +1,11 @@
 {
-  "name": "codex-model-router",
+  "name": "codex-baton",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A fail-closed model router for Codex Desktop and CLI app-server clients.",
+  "description": "Baton is a fail-closed model-switching proxy for Codex Desktop and CLI app-server clients.",
   "bin": {
-    "model-router": "bin/model-router"
+    "baton": "bin/baton"
   },
   "engines": {
     "node": ">=20"

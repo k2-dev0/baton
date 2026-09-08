@@ -27,7 +27,7 @@ const repositoryRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url))
 
 // 公開CLI入口を使い、推論を起動しない互換性検査用の実行環境を作る。
 function compatibilityFixture({ schema = protocol, script = "", version = "9.999.0" } = {}) {
-  const temporary = mkdtempSync(path.join(tmpdir(), "model-router-compatibility-"));
+  const temporary = mkdtempSync(path.join(tmpdir(), "baton-compatibility-"));
   const fakeCodex = path.join(temporary, "codex");
   const calls = path.join(temporary, "calls.jsonl");
   const configPath = path.join(temporary, "config.json");
@@ -45,9 +45,9 @@ if (process.argv[3] !== "generate-json-schema") process.exit(99);
 fs.writeFileSync(require("node:path").join(process.argv[process.argv.indexOf("--out") + 1], "codex_app_server_protocol.schemas.json"), ${JSON.stringify(JSON.stringify(schema))});
 `);
   chmodSync(fakeCodex, 0o755);
-  const env = { ...process.env, PATH: `${temporary}:${process.env.PATH}`, CODEX_MODEL_ROUTER_CONFIG: configPath, CODEX_MODEL_ROUTER_INNER_CODEX: fakeCodex,
-    CODEX_AUTO_CODEX_BIN: fakeCodex, CODEX_MODEL_ROUTER_STATE_DIR: temporary };
-  const run = (args = ["--router-check"], launcher = false) => spawnSync(launcher ? path.join(repositoryRoot, "bin/model-router") : process.execPath,
+  const env = { ...process.env, PATH: `${temporary}:${process.env.PATH}`, CODEX_BATON_CONFIG: configPath, CODEX_BATON_INNER_CODEX: fakeCodex,
+    CODEX_AUTO_CODEX_BIN: fakeCodex, CODEX_BATON_STATE_DIR: temporary };
+  const run = (args = ["--router-check"], launcher = false) => spawnSync(launcher ? path.join(repositoryRoot, "bin/baton") : process.execPath,
     launcher ? args : [path.join(repositoryRoot, "src/proxy.mjs"), ...args], { env, encoding: "utf8", timeout: 15_000 });
   return { run, calls, configPath };
 }
@@ -147,14 +147,14 @@ test.each([["直接中継", ["app-server"], false], ["CLI", [], true], ["Desktop
 // - 旧モードや固定設定を撤去し、再接続と複数プロセスで状態を失わない。
 // - DesktopとCLIの実機で、実行モデル・同一タスク・自動続行を確認する。
 
-test.runIf(process.env.MODEL_ROUTER_LIVE === "1")("実機で同一タスクのSol→Astra→Solと同じモデルの設定変更を追加入力なしに続行する", async () => {
-  const temporary = mkdtempSync("/private/tmp/model-router-live-");
-  const innerCodexPath = process.env.MODEL_ROUTER_TEST_CODEX ?? "/Applications/ChatGPT.app/Contents/Resources/codex";
+test.runIf(process.env.BATON_LIVE === "1")("実機で同一タスクのSol→Astra→Solと同じモデルの設定変更を追加入力なしに続行する", async () => {
+  const temporary = mkdtempSync("/private/tmp/baton-live-");
+  const innerCodexPath = process.env.BATON_TEST_CODEX ?? "/Applications/ChatGPT.app/Contents/Resources/codex";
   const configPath = path.join(temporary, "config.json");
   writeFileSync(configPath, JSON.stringify(makeConfig({ innerCodexPath, enabledRepositories: [temporary], maxBufferedBytes: 32 * 1024 * 1024,
   })));
   const child = spawn(process.execPath, [path.join(repositoryRoot, "src/proxy.mjs"), "app-server", "--listen", "stdio://"], {
-    cwd: temporary, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, CODEX_CLI_PATH: "", CODEX_MODEL_ROUTER_CONFIG: configPath, CODEX_MODEL_ROUTER_STATE_DIR: path.join(temporary, "router") },
+    cwd: temporary, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, CODEX_CLI_PATH: "", CODEX_BATON_CONFIG: configPath, CODEX_BATON_STATE_DIR: path.join(temporary, "router") },
   });
   const pending = new Map();
   const events = [];
@@ -195,14 +195,14 @@ test.runIf(process.env.MODEL_ROUTER_LIVE === "1")("実機で同一タスクのSo
   });
   const timeout = setTimeout(() => fail(new Error(`Live test timed out: ${stderr.slice(-2000)}`)), 180_000);
   try {
-    await send("initialize", { clientInfo: { name: "model_router_live_test", version: "0.1.0" }, capabilities: { experimentalApi: true } });
+    await send("initialize", { clientInfo: { name: "baton_live_test", version: "0.1.0" }, capabilities: { experimentalApi: true } });
     child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
     const started = await send("thread/start", {
       model: "gpt-5.6-sol", cwd: temporary, ephemeral: false, experimentalRawEvents: true,
       developerInstructions: "This is a model-switch integration test. Do not use any tools except switch_model. Follow the user's four ordered steps exactly.",
     });
     testThread = started.thread;
-    await send("turn/start", { threadId: started.thread.id, effort: "high", summary: "auto", personality: "pragmatic", input: [{ type: "text", text: 'Do exactly these steps, in order: 1. Call switch_model({"model":"gpt-6-astra","config":{"effort":"high","summary":"concise","personality":"friendly"}}) and await its result. 2. Then call switch_model({"model":"gpt-5.6-sol","config":{"effort":"high","summary":"auto","personality":"pragmatic"}}) and await its result. 3. Then call switch_model({"model":"gpt-5.6-sol","config":{"effort":"high","personality":"friendly"}}) to change settings on the same model and await its result. 4. Respond with exactly MODEL_ROUTER_LIVE_OK. Do not call tools in parallel. Do not do anything else.' }] });
+    await send("turn/start", { threadId: started.thread.id, effort: "high", summary: "auto", personality: "pragmatic", input: [{ type: "text", text: 'Do exactly these steps, in order: 1. Call switch_model({"model":"gpt-6-astra","config":{"effort":"high","summary":"concise","personality":"friendly"}}) and await its result. 2. Then call switch_model({"model":"gpt-5.6-sol","config":{"effort":"high","summary":"auto","personality":"pragmatic"}}) and await its result. 3. Then call switch_model({"model":"gpt-5.6-sol","config":{"effort":"high","personality":"friendly"}}) to change settings on the same model and await its result. 4. Respond with exactly BATON_LIVE_OK. Do not call tools in parallel. Do not do anything else.' }] });
     const result = await completed;
     writeFileSync(path.join(temporary, "events.json"), JSON.stringify(events, null, 2), { mode: 0o600 });
     console.log("Live evidence:", temporary, JSON.stringify(switches));
@@ -211,7 +211,7 @@ test.runIf(process.env.MODEL_ROUTER_LIVE === "1")("実機で同一タスクのSo
       models: switches.map((entry) => entry.model),
       sameTask: switches.every((entry) => entry.threadId === started.thread.id),
       status: result.turn.status,
-      finished: events.some((event) => event.method === "item/completed" && event.params.item.type === "agentMessage" && event.params.item.text.includes("MODEL_ROUTER_LIVE_OK")),
+      finished: events.some((event) => event.method === "item/completed" && event.params.item.type === "agentMessage" && event.params.item.text.includes("BATON_LIVE_OK")),
     }, { models: ["gpt-6-astra", "gpt-5.6-sol"], sameTask: true, status: "completed", finished: true });
     if (testThread.path) {
       const rollout = readFileSync(testThread.path, "utf8");
@@ -754,7 +754,7 @@ test("開始タイムアウト後に届く遅い成功も停止し、裏で実�
   engine.processServerMessage({ id: interrupt.id, result: {} });
   const settings = engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } }).upstream[0];
   const continuation = engine.processServerMessage({ id: settings.id, result: {} }).upstream[0];
-  const timeout = engine.processServerMessage({ id: continuation.id, error: { code: -32091, message: "model-router: turn/start timed out" } });
+  const timeout = engine.processServerMessage({ id: continuation.id, error: { code: -32091, message: "baton: turn/start timed out" } });
   assert.match(timeout.downstream[0].params.error.message, /timed out/);
   const late = engine.processServerMessage({ id: continuation.id, result: { turn: { id: "late-turn", status: "inProgress" } } });
   assert.deepEqual(late.upstream[0]?.params, { threadId: "main", turnId: "late-turn" });
@@ -762,7 +762,7 @@ test("開始タイムアウト後に届く遅い成功も停止し、裏で実�
 });
 
 test("中断受付後に完了通知が失われても待ち続けず失敗を返す", async () => {
-  const temporary = mkdtempSync(path.join(tmpdir(), "model-router-timeout-"));
+  const temporary = mkdtempSync(path.join(tmpdir(), "baton-timeout-"));
   const fakeCodex = path.join(temporary, "codex");
   writeFileSync(fakeCodex, `#!/usr/bin/env node
 ${schemaCommand}
@@ -815,7 +815,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
 });
 
 test("initialized通知がなくてもinitialize応答後にモデルカタログを取得する", async () => {
-  const temporary = mkdtempSync(path.join(tmpdir(), "model-router-initialize-"));
+  const temporary = mkdtempSync(path.join(tmpdir(), "baton-initialize-"));
   const fakeCodex = path.join(temporary, "codex");
   writeFileSync(
     fakeCodex,
@@ -1008,7 +1008,7 @@ test("モデル設定からタスク・会話・権限・作業指示を上書�
 });
 
 test("Desktopプロセスを検出できない環境では起動しない", () => {
-  const fakeBin = mkdtempSync(path.join(tmpdir(), "model-router-bin-"));
+  const fakeBin = mkdtempSync(path.join(tmpdir(), "baton-bin-"));
   const fakePgrep = path.join(fakeBin, "pgrep");
   const fakeCodex = path.join(fakeBin, "codex");
   writeFileSync(fakePgrep, "#!/bin/sh\nexit 3\n");
@@ -1016,7 +1016,7 @@ test("Desktopプロセスを検出できない環境では起動しない", () =
   chmodSync(fakePgrep, 0o755);
   chmodSync(fakeCodex, 0o755);
 
-  const result = spawnSync(path.join(repositoryRoot, "bin", "model-router"), ["app", repositoryRoot], {
+  const result = spawnSync(path.join(repositoryRoot, "bin", "baton"), ["app", repositoryRoot], {
     cwd: repositoryRoot,
     env: {
       ...process.env,
@@ -1033,7 +1033,7 @@ test("Desktopプロセスを検出できない環境では起動しない", () =
 });
 
 test("Desktop版をカレントディレクトリで起動する", () => {
-  const temporary = mkdtempSync(path.join(tmpdir(), "model-router-app-"));
+  const temporary = mkdtempSync(path.join(tmpdir(), "baton-app-"));
   const fakePgrep = path.join(temporary, "pgrep");
   const fakeCodex = path.join(temporary, "codex");
   const capturePath = path.join(temporary, "arguments.txt");
@@ -1051,14 +1051,14 @@ require("node:fs").writeFileSync(process.env.CODEX_AUTO_CAPTURE_PATH, process.ar
   chmodSync(fakeCodex, 0o755);
   writeFileSync(configPath, JSON.stringify(makeConfig({ innerCodexPath: fakeCodex })));
 
-  const result = spawnSync(path.join(repositoryRoot, "bin", "model-router"), ["app"], {
+  const result = spawnSync(path.join(repositoryRoot, "bin", "baton"), ["app"], {
     cwd: repositoryRoot,
     env: {
       ...process.env,
       PATH: `${temporary}:${process.env.PATH}`,
       CODEX_AUTO_CAPTURE_PATH: capturePath,
       CODEX_AUTO_CODEX_BIN: fakeCodex,
-      CODEX_MODEL_ROUTER_CONFIG: configPath,
+      CODEX_BATON_CONFIG: configPath,
     },
     encoding: "utf8",
   });
@@ -1071,7 +1071,7 @@ require("node:fs").writeFileSync(process.env.CODEX_AUTO_CAPTURE_PATH, process.ar
 });
 
 test("サブコマンドなしでCLI版をカレントディレクトリのルーターへ接続する", () => {
-  const temporary = mkdtempSync(path.join(tmpdir(), "model-router-cli-"));
+  const temporary = mkdtempSync(path.join(tmpdir(), "baton-cli-"));
   const fakeCodex = path.join(temporary, "codex");
   const capturePath = path.join(temporary, "arguments.txt");
   const configPath = path.join(temporary, "config.json");
@@ -1090,14 +1090,14 @@ else require("node:fs").writeFileSync(process.env.CODEX_AUTO_CAPTURE_PATH, proce
     JSON.stringify(makeConfig({ innerCodexPath: fakeCodex })),
   );
 
-  const result = spawnSync(path.join(repositoryRoot, "bin", "model-router"), ["--search"], {
+  const result = spawnSync(path.join(repositoryRoot, "bin", "baton"), ["--search"], {
     cwd: repositoryRoot,
     env: {
       ...process.env,
       CODEX_AUTO_CAPTURE_PATH: capturePath,
       CODEX_AUTO_CODEX_BIN: fakeCodex,
-      CODEX_MODEL_ROUTER_CONFIG: configPath,
-      CODEX_MODEL_ROUTER_STATE_DIR: path.join(temporary, "state"),
+      CODEX_BATON_CONFIG: configPath,
+      CODEX_BATON_STATE_DIR: path.join(temporary, "state"),
     },
     encoding: "utf8",
     timeout: 10_000,
@@ -1111,7 +1111,7 @@ else require("node:fs").writeFileSync(process.env.CODEX_AUTO_CAPTURE_PATH, proce
 });
 
 test("設定ファイル内の行コメントを許可する", () => {
-  const temporary = mkdtempSync(path.join(tmpdir(), "model-router-config-"));
+  const temporary = mkdtempSync(path.join(tmpdir(), "baton-config-"));
   const fakeCodex = path.join(temporary, "codex");
   const configPath = path.join(temporary, "config.json");
   writeFileSync(fakeCodex, `#!/usr/bin/env node\n${schemaCommand}\nconsole.log("codex-cli 0.153.1");\n`);
@@ -1126,8 +1126,8 @@ test("設定ファイル内の行コメントを許可する", () => {
     cwd: repositoryRoot,
     env: {
       ...process.env,
-      CODEX_MODEL_ROUTER_CONFIG: configPath,
-      CODEX_MODEL_ROUTER_INNER_CODEX: fakeCodex,
+      CODEX_BATON_CONFIG: configPath,
+      CODEX_BATON_INNER_CODEX: fakeCodex,
     },
     encoding: "utf8",
   });
