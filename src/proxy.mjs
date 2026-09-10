@@ -329,20 +329,37 @@ export class RouterEngine {
     if (message.method === "item/tool/call") {
       const args = message.params.arguments;
       let error = this.switchRequest.validateRequest(args);
+      let reasonCode = error ? "invalid-request" : null;
       if (!this.compatible || thread?.isMain !== true ||
-          !isRepositoryEnabled(thread?.cwd, this.config.enabledRepositories)) error = "This is not an enabled main task.";
-      if (!thread?.turnParams || thread.activeTurnId !== message.params.turnId) error = "The calling turn is no longer active.";
-      if (state) error = "A model switch is already in progress.";
+          !isRepositoryEnabled(thread?.cwd, this.config.enabledRepositories)) {
+        error = "This is not an enabled main task.";
+        reasonCode = "task-unavailable";
+      }
+      if (!thread?.turnParams || thread.activeTurnId !== message.params.turnId) {
+        error = "The calling turn is no longer active.";
+        reasonCode = "turn-inactive";
+      }
+      if (state) {
+        error = "A model switch is already in progress.";
+        reasonCode = "switch-in-progress";
+      }
       if ([...this.pending.values()].some((request) => request.kind === "settings" && request.threadId === threadId)) {
         error = "Await the user's settings change before switching the model.";
+        reasonCode = "settings-pending";
       }
       const otherItems = Object.values(thread?.activeItems ?? {}).filter((item) => item.id !== message.params.callId);
       if (otherItems.length || [...this.serverRequests.values()].includes(threadId)) {
         error = "Await other tools and approvals before switching the model.";
+        reasonCode = "other-work";
       }
       const effort = args?.config?.effort;
-      if (!error) error = this.#availabilityError(args.model, effort)?.message ?? null;
+      if (!error) {
+        const availabilityError = this.#availabilityError(args.model, effort);
+        error = availabilityError?.message ?? null;
+        reasonCode = availabilityError?.code ?? null;
+      }
       if (error) {
+        this.diagnostics.record("switch-rejected", { threadId, phase: "request", reasonCode });
         action.upstream.push({ id: message.id, result: {
           success: false, contentItems: [{ type: "inputText", text: error }],
         } });
@@ -350,7 +367,7 @@ export class RouterEngine {
       }
       state = { call: cloneJson(message), threadId, turnId: message.params.turnId,
         model: args.model, effort, settings: cloneJson(args.config),
-        phase: "inspect", interrupted: false, interruptAccepted: false, cancelled: false };
+        phase: "settle", interrupted: false, interruptAccepted: false, cancelled: false, callResolved: true };
       this.switches.set(threadId, state);
     } else if (!state) {
       if (pending) this.pending.delete(requestKey(message.id));
@@ -411,8 +428,6 @@ export class RouterEngine {
       }
       if (state.cancelled) {
         this.#releaseInterruption(state, action);
-        if (state.phase === "inspect") action.upstream.push({ id: state.call.id, result: { success: false,
-          contentItems: [{ type: "inputText", text: "Model switch cancelled by a user operation." }] } });
         if (state.phase === "continue" && message.result?.turn?.status === "inProgress") {
           state.phase = "cancel";
           const id = "baton:switch:" + randomUUID();
@@ -423,19 +438,7 @@ export class RouterEngine {
         this.switches.delete(threadId);
         return action;
       }
-      if (state.phase === "inspect") {
-        const otherWork = Object.values(thread.activeItems).some((item) => item.id !== state.call.params.callId);
-        if (!Array.isArray(message.result?.data) || message.result.data.length || message.result.nextCursor ||
-            otherWork || [...this.serverRequests.values()].includes(threadId) || thread.activeTurnId !== state.turnId) {
-          this.switches.delete(threadId);
-          action.upstream.push({ id: state.call.id, result: { success: false,
-            contentItems: [{ type: "inputText", text: "Background commands are running or their state could not be verified. Await them before switching." }] } });
-          return action;
-        }
-        // 応答を返しただけでは中断しない。Codex側のツール完了通知を待つ。
-        state.phase = "settle";
-        state.callResolved = true;
-      } else if (state.phase === "interrupt") {
+      if (state.phase === "interrupt") {
         state.interruptAccepted = true;
         if (!state.interrupted) return action;
         state.phase = "settings";
@@ -464,10 +467,7 @@ export class RouterEngine {
     state.requestId = id;
     let method = "turn/interrupt";
     let params = { threadId, turnId: state.turnId };
-    if (state.phase === "inspect") {
-      method = "thread/backgroundTerminals/list";
-      params = { threadId };
-    } else if (state.phase === "settings") {
+    if (state.phase === "settings") {
       method = "thread/settings/update";
       // この操作はモデルと思考量の同期用。追加設定一式は続行時のturn/startへ渡す。
       params = { threadId, model: state.model, effort: state.effort };

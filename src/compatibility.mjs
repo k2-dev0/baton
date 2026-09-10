@@ -62,7 +62,6 @@ function checkProtocol(root) {
     "thread/start": ["cwd:string", "dynamicTools.*"],
     "thread/resume": ["threadId:string"],
     "thread/fork": ["threadId:string"],
-    "thread/backgroundTerminals/list": ["threadId:string"],
     "turn/interrupt": ["threadId:string", "turnId:string"],
     "thread/settings/update": ["threadId:string", "model:string", "effort:string", "collaborationMode.settings.model:string", "collaborationMode.settings.reasoning_effort:string"],
     "turn/start": ["threadId:string", "input:array", "model:string", "effort:string", "collaborationMode.settings.model:string", "collaborationMode.settings.reasoning_effort:string", "toolOutput.name:string", "toolOutput.output:string", "turnTrigger:string"],
@@ -78,7 +77,6 @@ function checkProtocol(root) {
   };
   const generatedInputs = {
     "model/list": ["cursor", "limit", "includeHidden"],
-    "thread/backgroundTerminals/list": ["threadId"],
     "turn/interrupt": ["threadId", "turnId"],
     "thread/settings/update": ["threadId", "model", "effort"],
     "turn/start": ["threadId", "input", "model", "effort", "toolOutput", "turnTrigger"],
@@ -112,7 +110,6 @@ function checkProtocol(root) {
     ThreadStartResponse: ["thread.id:string", "thread.cwd:string", "thread.parentThreadId:string", "thread.status", "model:string"],
     ThreadResumeResponse: ["thread.id:string", "thread.cwd:string", "thread.parentThreadId:string", "thread.status", "model:string"],
     ThreadForkResponse: ["thread.id:string", "thread.cwd:string", "thread.parentThreadId:string", "thread.status", "model:string"],
-    ThreadBackgroundTerminalsListResponse: ["data:array", "nextCursor:string"],
     TurnStartResponse: ["turn.id:string", "turn.status:string"],
   };
   for (const [name, fields] of Object.entries(responses)) requireFields(root, root.definitions.v2?.[name], fields, name);

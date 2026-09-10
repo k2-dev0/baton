@@ -347,9 +347,7 @@ function beginSwitchTest(options = {}) {
 
 function switch_model(engine, call) {
   const result = engine.processServerMessage(call);
-  if (result.upstream[0]?.method !== "thread/backgroundTerminals/list") return result;
-  const reply = engine.processServerMessage({ id: result.upstream[0].id, result: { data: [], nextCursor: null } });
-  if (!reply.waitFor) return reply;
+  if (!result.waitFor) return result;
   return engine.processServerMessage({ method: "item/completed", params: { threadId: call.params.threadId, turnId: call.params.turnId,
     item: { id: call.params.callId, type: "dynamicToolCall", status: "completed", success: true } } });
 }
@@ -358,8 +356,7 @@ test("切り替えツールへ一度応答し、Codexの完了通知まで中断
   const { engine, call, diagnostics } = beginSwitchTest();
   announceThread(engine, "other", { model: "gpt-5.6-sol" });
   const otherBefore = structuredClone(engine.threads.other);
-  const inspect = engine.processServerMessage(call).upstream[0];
-  const reply = engine.processServerMessage({ id: inspect.id, result: { data: [], nextCursor: null } });
+  const reply = engine.processServerMessage(call);
   assert.equal(reply.upstream.length, 1);
   assert.equal(reply.upstream[0].id, call.id);
   assert.equal(JSON.parse(reply.upstream[0].result.contentItems[0].text).status, "pending");
@@ -382,8 +379,7 @@ test("切り替えツールへ一度応答し、Codexの完了通知まで中断
 
 test.each(["stop", "other-work", "failed", "timeout", "turn-end"])("ツール応答後の%sは未応答中断や勝手な続行を起こさない", (race) => {
   const { engine, call } = beginSwitchTest();
-  const inspect = engine.processServerMessage(call).upstream[0];
-  const reply = engine.processServerMessage({ id: inspect.id, result: { data: [], nextCursor: null } });
+  const reply = engine.processServerMessage(call);
   if (race === "stop") engine.processClientMessage({ id: "stop", method: "turn/interrupt", params: { threadId: "main", turnId: "old-turn" } });
   if (race === "other-work") engine.processServerMessage({ method: "item/started", params: { threadId: "main", turnId: "old-turn", item: { id: "command", type: "commandExecution" } } });
   const event = race === "timeout" ? { id: reply.waitFor[0].id, error: { code: -1, message: "baton: item/completed timed out" } }
@@ -531,13 +527,16 @@ test("解析できない設定仕様や欠落参照は受付を始める前に�
   }
 });
 
-test("応答済みでも裏で動いているコマンドを確認し、残っていれば中断しない", () => {
+test("完了済みコマンドの常駐プロセスを再検査せず、現在の未完了作業だけで切り替えを判定する", () => {
   const { engine, call } = beginSwitchTest();
-  const check = engine.processServerMessage(call).upstream[0];
-  assert.equal(check.method, "thread/backgroundTerminals/list");
-  const result = engine.processServerMessage({ id: check.id, result: { data: [{ processId: "running" }], nextCursor: null } });
-  assert.equal(result.upstream[0].result.success, false);
-  assert.equal(engine.threads.main.activeTurnId, "old-turn");
+  engine.processServerMessage({ method: "item/started", params: { threadId: "main", turnId: "old-turn",
+    item: { id: "server", type: "commandExecution" } } });
+  engine.processServerMessage({ method: "item/completed", params: { threadId: "main", turnId: "old-turn",
+    item: { id: "server", type: "commandExecution" } } });
+  const reply = engine.processServerMessage(call);
+  assert.equal(reply.upstream[0].result.success, true);
+  assert.equal(JSON.parse(reply.upstream[0].result.contentItems[0].text).status, "pending");
+  assert.equal(reply.upstream.some((request) => request.method === "thread/backgroundTerminals/list"), false);
 });
 
 test("設定変更と切り替えを競合させず、中断前の取消はツールを失敗応答で解放する", () => {
@@ -545,10 +544,12 @@ test("設定変更と切り替えを競合させず、中断前の取消はツ�
   engine.processClientMessage({ id: "settings-user", method: "thread/settings/update", params: { threadId: "main", approvalPolicy: "never" } });
   assert.equal(engine.processServerMessage(call).upstream[0].result.success, false);
   engine.processServerMessage({ id: "settings-user", result: {} });
-  const check = engine.processServerMessage(call).upstream[0];
+  const reply = engine.processServerMessage(call);
   engine.processClientMessage({ id: "settings-user2", method: "thread/settings/update", params: { threadId: "main", approvalPolicy: "unlessTrusted" } });
-  const cancelled = engine.processServerMessage({ id: check.id, result: { data: [], nextCursor: null } });
-  assert.equal(cancelled.upstream[0].result.success, false);
+  const cancelled = engine.processServerMessage({ method: "item/completed", params: { threadId: "main", turnId: "old-turn",
+    item: { id: call.params.callId, type: "dynamicToolCall", status: "completed", success: true } } });
+  assert.equal(reply.upstream[0].result.success, true);
+  assert.equal(cancelled.downstream[0].method, "error");
   assert.equal(engine.threads.main.activeTurnId, "old-turn");
 });
 
@@ -615,7 +616,7 @@ test("effort欠落、不正指定、利用不能モデル、古いターン、�
 });
 
 test("並行ツールや承認待ちがある間は変更を拒否し、通常の承認応答は透過する", () => {
-  const { engine, call } = beginSwitchTest();
+  const { engine, call, diagnostics } = beginSwitchTest();
   const approval = { id: 8, method: "item/commandExecution/requestApproval", params: { threadId: "main", turnId: "old-turn" } };
   assert.equal(engine.processServerMessage(approval), undefined);
   assert.equal(switch_model(engine, call).upstream[0].result.success, false);
@@ -625,6 +626,10 @@ test("並行ツールや承認待ちがある間は変更を拒否し、通常�
   assert.equal(switch_model(engine, call).upstream[0].result.success, false);
   engine.processServerMessage({ method: "item/completed", params: { threadId: "main", turnId: "old-turn", item: { id: "command", type: "commandExecution" } } });
   assert.equal(switch_model(engine, call).upstream[0].method, "turn/interrupt");
+  assert.deepEqual(diagnostics.events.filter((entry) => entry.event === "switch-rejected"), [
+    { event: "switch-rejected", threadId: "main", phase: "request", reasonCode: "other-work" },
+    { event: "switch-rejected", threadId: "main", phase: "request", reasonCode: "other-work" },
+  ]);
 });
 
 test("停止・新しいユーザー入力は切り替えを取り消し、自動続行しない", () => {
@@ -745,7 +750,6 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     send({ id: m.id, result: { turn: { id: "turn", status: "inProgress" } } });
     send({ id: "switch", method: "item/tool/call", params: { threadId: "main", turnId: "turn", callId: "switch", namespace: null, tool: "switch_model", arguments: { model: "gpt-6-astra", config: { effort: "high" } } } });
   }
-  if (m.method === "thread/backgroundTerminals/list") send({ id: m.id, result: { data: [], nextCursor: null } });
   if (m.method === "turn/interrupt") {
     send({ id: m.id, result: {} });
     if (${JSON.stringify(completeSwitch)} === true) send({ method: "turn/completed", params: { threadId: "main", turn: { id: "turn", status: "interrupted" } } });
