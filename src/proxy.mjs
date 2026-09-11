@@ -16,6 +16,7 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { applySelection, isRepositoryEnabled, validateConfig } from "./policy.mjs";
+import { runPreModelSwitchHooks, loadPreModelSwitchHooks } from "./hooks.mjs";
 import { createUnixWebSocketLineServer } from "./websocket.mjs";
 import { checkCliCompatibility } from "./compatibility.mjs";
 
@@ -157,12 +158,16 @@ export class MemoryDiagnostics {
 }
 
 export class RouterEngine {
-  constructor({ config, diagnostics, stateStore, switchRequest, compatible = true }) {
+  constructor({ config, diagnostics, stateStore, switchRequest, compatible = true,
+    preModelSwitchRunner = runPreModelSwitchHooks, hookLoader = loadPreModelSwitchHooks, onAsyncAction }) {
     this.config = config;
     this.switchRequest = switchRequest;
     this.diagnostics = diagnostics;
     this.stateStore = stateStore;
     this.compatible = compatible;
+    this.preModelSwitchRunner = preModelSwitchRunner;
+    this.hookLoader = hookLoader;
+    this.onAsyncAction = onAsyncAction;
     this.threads = stateStore.getThreads();
     this.pending = new Map();
     this.modelCatalog = null;
@@ -212,12 +217,12 @@ export class RouterEngine {
     const threadId = message.params?.threadId;
     const switching = this.switches.get(threadId);
     if (["thread/settings/update", "turn/settings/update"].includes(message.method) && hasRequestId(message)) {
-      if (switching) switching.cancelled = true;
+      if (switching) this.#cancelSwitch(switching);
       this.pending.set(requestKey(message.id), { kind: "settings", threadId, method: message.method, params: cloneJson(message.params) });
       return { type: "forward", message, modified: false };
     }
     if (switching && ["turn/interrupt", "turn/start", "turn/steer", "thread/archive", "thread/unsubscribe", "thread/rollback", "thread/revert"].includes(message.method)) {
-      switching.cancelled = true;
+      this.#cancelSwitch(switching);
       if (["turn/start", "turn/steer"].includes(message.method)) {
         return { type: "local-error", message: this.#localError(message.id, "Model switch cancelled. Wait for the current turn to stop, then resend this input; it was not submitted.") };
       }
@@ -358,6 +363,16 @@ export class RouterEngine {
         error = availabilityError?.message ?? null;
         reasonCode = availabilityError?.code ?? null;
       }
+      let handlers = [];
+      if (!error) {
+        try {
+          handlers = this.hookLoader(thread.cwd, this.config.enabledRepositories);
+          if (handlers.length && typeof this.onAsyncAction !== "function") throw new Error("PreModelSwitch requires an asynchronous action handler");
+        } catch (cause) {
+          error = `PreModelSwitch configuration failed: ${cause.message}`;
+          reasonCode = "hook-config-invalid";
+        }
+      }
       if (error) {
         this.diagnostics.record("switch-rejected", { threadId, phase: "request", reasonCode });
         action.upstream.push({ id: message.id, result: {
@@ -369,6 +384,30 @@ export class RouterEngine {
         model: args.model, effort, settings: cloneJson(args.config),
         phase: "settle", interrupted: false, interruptAccepted: false, cancelled: false, callResolved: true };
       this.switches.set(threadId, state);
+      if (handlers.length) {
+        state.hookCount = handlers.length;
+        state.phase = "pre-hook";
+        state.callResolved = false;
+        state.hookAbortController = new AbortController();
+        const event = {
+          event: "PreModelSwitch",
+          threadId,
+          turnId: state.turnId,
+          cwd: thread.cwd,
+          from: { model: thread.selectedModel, effort: thread.selectedEffort },
+          to: { model: state.model, config: cloneJson(state.settings) },
+        };
+        this.diagnostics.record("pre-model-switch-hook-started", { threadId, hookCount: handlers.length });
+        Promise.resolve()
+          .then(() => this.preModelSwitchRunner(handlers, event, { signal: state.hookAbortController.signal }))
+          .then(
+            (result) => this.#completePreModelSwitch(state, result),
+            (error) => this.#completePreModelSwitch(state, { allowed: false,
+              reason: `PreModelSwitch hook runner failed: ${error instanceof Error ? error.message : String(error)}`,
+              reasonCode: "runner-failed" }),
+          );
+        return action;
+      }
     } else if (!state) {
       if (pending) this.pending.delete(requestKey(message.id));
       return action;
@@ -386,6 +425,12 @@ export class RouterEngine {
       }
       state.phase = "interrupt";
     } else if (message.method === "turn/completed") {
+      if (message.params.turn?.id === state.turnId && state.phase === "pre-hook") {
+        this.switches.delete(threadId);
+        state.hookAbortController?.abort();
+        this.diagnostics.record("switch-failed", { threadId, phase: "pre-hook", error: "Turn ended while PreModelSwitch hooks were running." });
+        return action;
+      }
       if (message.params.turn?.id === state.turnId && state.phase === "settle") {
         this.pending.delete(requestKey(state.requestId));
         this.switches.delete(threadId);
@@ -462,6 +507,8 @@ export class RouterEngine {
         return action;
       }
     }
+    if (state.phase === "settle") return this.#settleAcceptedSwitch(state, action);
+
     const id = "baton:switch:" + randomUUID();
     if (state.requestId) this.pending.delete(requestKey(state.requestId));
     state.requestId = id;
@@ -492,16 +539,69 @@ export class RouterEngine {
       }) };
     }
     this.pending.set(requestKey(id), { kind: "switch", threadId, params: cloneJson(params) });
-    if (state.phase === "settle") {
-      action.upstream.push({ id: state.call.id, result: { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({
-        status: "pending", model: state.model, config: state.settings,
-        message: "Baton accepted the handoff request; settings are not applied yet. Do not start further work. Baton will interrupt and continue this task with the requested settings.",
-      }) }] } });
-      action.waitFor = [{ id, method: "item/completed", params: { threadId, turnId: state.turnId } }];
-      return action;
-    }
     action.upstream.push({ id, method, params });
     return action;
+  }
+
+  // hook完了後だけツール受付を返し、旧ターンが有効な間に限って既存の切り替えへ接続する。
+  #completePreModelSwitch(state, result) {
+    if (this.switches.get(state.threadId) !== state || state.phase !== "pre-hook") return;
+    state.hookAbortController = null;
+    const action = { consume: true, upstream: [], downstream: [] };
+    const thread = this.threads[state.threadId];
+    if (state.cancelled || thread?.activeTurnId !== state.turnId) {
+      this.switches.delete(state.threadId);
+      this.diagnostics.record("switch-rejected", { threadId: state.threadId, phase: "pre-hook", reasonCode: "cancelled" });
+      if (thread?.activeTurnId === state.turnId) {
+        action.upstream.push({ id: state.call.id, result: { success: false,
+          contentItems: [{ type: "inputText", text: "Model switch cancelled while PreModelSwitch hooks were running." }] } });
+      }
+      this.onAsyncAction(action);
+      return;
+    }
+    if (!isObject(result) || result.allowed !== true) {
+      this.switches.delete(state.threadId);
+      const reason = typeof result?.reason === "string" && result.reason.length
+        ? result.reason
+        : "PreModelSwitch hook rejected the model switch.";
+      this.diagnostics.record("switch-rejected", { threadId: state.threadId, phase: "pre-hook",
+        reasonCode: result?.reasonCode ?? "invalid-result", hookIndex: result?.hookIndex ?? null });
+      action.upstream.push({ id: state.call.id, result: { success: false,
+        contentItems: [{ type: "inputText", text: reason }] } });
+      this.onAsyncAction(action);
+      return;
+    }
+    state.phase = "settle";
+    state.callResolved = true;
+    this.diagnostics.record("pre-model-switch-hook-completed", { threadId: state.threadId,
+      hookCount: result.hookCount ?? state.hookCount });
+    this.onAsyncAction(this.#settleAcceptedSwitch(state, action));
+  }
+
+  // hookなしの同期経路とhook成功後の非同期経路で同じ受付・完了待ちを使う。
+  #settleAcceptedSwitch(state, action) {
+    const id = "baton:switch:" + randomUUID();
+    if (state.requestId) this.pending.delete(requestKey(state.requestId));
+    state.requestId = id;
+    this.pending.set(requestKey(id), { kind: "switch", threadId: state.threadId,
+      params: { threadId: state.threadId, turnId: state.turnId } });
+    action.upstream.push({ id: state.call.id, result: { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({
+      status: "pending", model: state.model, config: state.settings,
+      message: "Baton accepted the handoff request; settings are not applied yet. Do not start further work. Baton will interrupt and continue this task with the requested settings.",
+    }) }] } });
+    action.waitFor = [{ id, method: "item/completed", params: { threadId: state.threadId, turnId: state.turnId } }];
+    return action;
+  }
+
+  #cancelSwitch(state) {
+    state.cancelled = true;
+    state.hookAbortController?.abort();
+  }
+
+  // App Server終了時に未完了hookを残さず、遅い完了通知も破棄する。
+  shutdown() {
+    for (const state of this.switches.values()) this.#cancelSwitch(state);
+    this.switches.clear();
   }
 
   // 続行失敗・利用者の取消では終了状態をCLIにも伝え、実行中表示を残さない。
@@ -675,7 +775,9 @@ export function runAppServerProxy({
   const { switchRequest, ...compatibility } = checkCliCompatibility(innerCodexPath);
   diagnostics.record("proxy-start", { ...compatibility, compatible: compatibility.ok });
   if (!compatibility.ok) throw new Error(`incompatible Codex: ${compatibility.reason}`);
-  const engine = new RouterEngine({ config, diagnostics, stateStore, switchRequest });
+  let dispatchAsyncAction = () => {};
+  const engine = new RouterEngine({ config, diagnostics, stateStore, switchRequest,
+    onAsyncAction: (action) => dispatchAsyncAction(action) });
 
   const child = spawn(innerCodexPath, args, {
     env: { ...process.env, CODEX_CLI_PATH: "" },
@@ -708,6 +810,7 @@ export function runAppServerProxy({
     if (failed) return;
     failed = true;
     diagnostics.record("proxy-failure", { reason: error.message });
+    engine.shutdown();
     process.stderr.write(`codex-baton: ${error.message}\n`);
     process.exitCode = 70;
     child.kill("SIGTERM");
@@ -790,7 +893,37 @@ export function runAppServerProxy({
     },
   });
 
-  const serverDecoder = new JsonLineDecoder({
+  let serverDecoder;
+  const dispatchServerAction = (action, originalLine) => {
+    for (const [id, timer] of switchTimers) {
+      if (!engine.pending.has(requestKey(id))) {
+        clearTimeout(timer);
+        switchTimers.delete(id);
+      }
+    }
+    for (const outgoing of action?.upstream ?? []) {
+      recordControlMessage(diagnostics, "baton", outgoing);
+      writeRespectingBackpressure(child.stdin, JSON.stringify(outgoing) + "\n", clientReadable);
+    }
+    const timedRequests = [...(action?.upstream ?? []).filter(outgoing => outgoing.method), ...(action?.waitFor ?? [])];
+    for (const outgoing of timedRequests) {
+      switchTimers.set(outgoing.id, setTimeout(() => {
+        diagnostics.record("switch-request-timeout", { requestId: outgoing.id, method: outgoing.method,
+          threadId: outgoing.params?.threadId, turnId: outgoing.params?.turnId });
+        serverDecoder.onLine(JSON.stringify({ id: outgoing.id, error: {
+          code: -32091, message: "baton: " + outgoing.method + " timed out",
+        } }));
+      }, SWITCH_REQUEST_TIMEOUT_MS));
+    }
+    for (const outgoing of action?.downstream ?? []) {
+      writeRespectingBackpressure(clientWritable, JSON.stringify(outgoing) + "\n", child.stdout);
+    }
+    if (originalLine !== undefined && !action?.consume) {
+      writeRespectingBackpressure(clientWritable, `${originalLine}\n`, child.stdout);
+    }
+  };
+
+  serverDecoder = new JsonLineDecoder({
     maxBufferedBytes: config.maxBufferedBytes,
     onLine(line) {
       try {
@@ -835,35 +968,20 @@ export function runAppServerProxy({
             threadId: message.params?.threadId, turnId: message.params?.turn?.id,
             status: message.params?.turn?.status });
         }
-        for (const [id, timer] of switchTimers) {
-          if (!engine.pending.has(requestKey(id))) {
-            clearTimeout(timer);
-            switchTimers.delete(id);
-          }
-        }
-        for (const outgoing of action?.upstream ?? []) {
-          recordControlMessage(diagnostics, "baton", outgoing);
-          writeRespectingBackpressure(child.stdin, JSON.stringify(outgoing) + "\n", clientReadable);
-        }
-        const timedRequests = [...(action?.upstream ?? []).filter(outgoing => outgoing.method), ...(action?.waitFor ?? [])];
-        for (const outgoing of timedRequests) {
-          switchTimers.set(outgoing.id, setTimeout(() => {
-            diagnostics.record("switch-request-timeout", { requestId: outgoing.id, method: outgoing.method,
-              threadId: outgoing.params?.threadId, turnId: outgoing.params?.turnId });
-            serverDecoder.onLine(JSON.stringify({ id: outgoing.id, error: {
-              code: -32091, message: "baton: " + outgoing.method + " timed out",
-            } }));
-          }, SWITCH_REQUEST_TIMEOUT_MS));
-        }
-        for (const outgoing of action?.downstream ?? []) {
-          writeRespectingBackpressure(clientWritable, JSON.stringify(outgoing) + "\n", child.stdout);
-        }
-        if (!action?.consume) writeRespectingBackpressure(clientWritable, `${line}\n`, child.stdout);
+        dispatchServerAction(action, line);
       } catch (error) {
         failProtocol(error);
       }
     },
   });
+  dispatchAsyncAction = (action) => {
+    if (childExited || failed) return;
+    try {
+      dispatchServerAction(action);
+    } catch (error) {
+      failProtocol(error);
+    }
+  };
 
   clientReadable.on("data", (chunk) => {
     if (childExited || failed) return;
@@ -902,6 +1020,7 @@ export function runAppServerProxy({
   child.on("error", failProtocol);
   child.on("exit", (code, signal) => {
     childExited = true;
+    engine.shutdown();
     for (const timer of switchTimers.values()) clearTimeout(timer);
     switchTimers.clear();
     clientReadable.pause();
@@ -920,6 +1039,7 @@ export function runAppServerProxy({
     process.once(signal, () => {
       terminatingSignal = signal;
       diagnostics.record("proxy-signal", { signal });
+      engine.shutdown();
       child.kill(signal);
       const signalExitCodes = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
       scheduleForcedExit(signalExitCodes[signal] ?? 128);

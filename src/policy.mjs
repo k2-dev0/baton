@@ -30,6 +30,7 @@ function normalizeRepository(repository) {
 // 外部JSON設定を実行前に検証し、判定処理が使える内部設定へ変換する。
 export function validateConfig(input) {
   if (!isPlainObject(input)) throw new Error("config must be a JSON object");
+  if (Object.hasOwn(input, "hooks")) throw new Error("Move hooks from config.json to the project's .codex/hooks.json");
   if (input.schemaVersion !== 2) throw new Error("config.schemaVersion must be 2; migrate using config_sample.json");
   const removed = ["mode", "requestModelPolicy", "fixedModel", "threadPins", "escalatedThreads", "efforts", "rulesVersion"];
   if (removed.some((key) => Object.hasOwn(input, key))) {
