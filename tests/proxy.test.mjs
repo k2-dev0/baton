@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -215,10 +215,12 @@ function makeConfig(overrides = {}) {
   });
 }
 
-function makeEngine(config = makeConfig(), { compatible = true } = {}) {
+function makeEngine(config = makeConfig(), { compatible = true, preModelSwitchRunner, onAsyncAction, hookLoader } = {}) {
   const diagnostics = new MemoryDiagnostics();
   const stateStore = new MemoryStateStore();
-  const engine = new RouterEngine({ config, diagnostics, stateStore, compatible, switchRequest: createSwitchRequest(protocol) });
+  const engine = new RouterEngine({ config, diagnostics, stateStore, compatible, switchRequest: createSwitchRequest(protocol),
+    ...(preModelSwitchRunner ? { preModelSwitchRunner } : {}), ...(onAsyncAction ? { onAsyncAction } : {}),
+    ...(hookLoader ? { hookLoader } : {}) });
   engine.setModelCatalog([
     {
       model: "gpt-5.6-sol",
@@ -333,7 +335,7 @@ test("追加ツールと実験機能を既存の指示・ツール・通知設�
 });
 
 function beginSwitchTest(options = {}) {
-  const context = makeEngine(options.config);
+  const context = makeEngine(options.config, options.engineOptions);
   const { engine } = context;
   announceThread(engine, "main", { model: "gpt-5.6-sol", ...options });
   const params = { model: "gpt-5.6-sol", effort: "high", outputSchema: { type: "object" },
@@ -344,6 +346,115 @@ function beginSwitchTest(options = {}) {
   const call = { id: "tool-call", method: "item/tool/call", params: { threadId: "main", turnId: "old-turn", callId: "switch-item", namespace: null, tool: "switch_model", arguments: { model: "gpt-6-astra", config: { effort: "high" } } } };
   return { ...context, call };
 }
+
+test("PreModelSwitch hookの許可を非同期に待ち、待機中も別要求を処理してから既存の切り替えへ進む", async () => {
+  let finishHook;
+  let hookEvent;
+  const asyncActions = [];
+  const { engine, call, diagnostics } = beginSwitchTest({ engineOptions: {
+    hookLoader: () => [{ command: "/usr/bin/true", timeout: 5 }],
+    preModelSwitchRunner(_handlers, event) {
+      hookEvent = event;
+      return new Promise((resolve) => { finishHook = resolve; });
+    },
+    onAsyncAction: (action) => asyncActions.push(action),
+  } });
+
+  const waiting = engine.processServerMessage(call);
+  assert.deepEqual(waiting.upstream, []);
+  assert.equal(engine.switches.get("main").phase, "pre-hook");
+  assert.equal(engine.threads.main.activeTurnId, "old-turn");
+  const unrelated = { id: "other", method: "thread/resume", params: { threadId: "other" } };
+  assert.equal(engine.processClientMessage(unrelated).message, unrelated, "hook待機中も別要求を同期処理する");
+  assert.deepEqual(hookEvent, undefined, "hook実行は受信処理の外へ遅延する");
+
+  await vi.waitFor(() => assert.equal(typeof finishHook, "function"));
+  assert.deepEqual(hookEvent, {
+    event: "PreModelSwitch", threadId: "main", turnId: "old-turn", cwd: repository,
+    from: { model: "gpt-5.6-sol", effort: "high" },
+    to: { model: "gpt-6-astra", config: { effort: "high" } },
+  });
+  finishHook({ allowed: true, reasonCode: "allowed", hookCount: 1 });
+  await vi.waitFor(() => assert.equal(asyncActions.length, 1));
+  const accepted = asyncActions.shift();
+  assert.equal(JSON.parse(accepted.upstream[0].result.contentItems[0].text).status, "pending");
+  assert.equal(engine.threads.main.activeTurnId, "old-turn", "hook成功だけでは旧ターンを中断しない");
+  const interrupt = engine.processServerMessage({ method: "item/completed", params: { threadId: "main", turnId: "old-turn",
+    item: { id: "switch-item", type: "dynamicToolCall", status: "completed", success: true } } }).upstream[0];
+  assert.equal(interrupt.method, "turn/interrupt");
+  assert.equal(diagnostics.events.filter((event) => event.event === "pre-model-switch-hook-completed").length, 1);
+});
+
+test.each([
+  [{ allowed: false, reason: "policy denied", reasonCode: "denied", hookIndex: 0 }, /policy denied/],
+  [new Error("runner crashed"), /runner crashed/],
+])("PreModelSwitch hookの拒否・異常は旧ターンを保ったままfail-closedにする", async (outcome, reason) => {
+  const asyncActions = [];
+  const { engine, call, diagnostics } = beginSwitchTest({ engineOptions: {
+    hookLoader: () => [{ command: "/usr/bin/false", timeout: 5 }],
+    preModelSwitchRunner: () => outcome instanceof Error ? Promise.reject(outcome) : Promise.resolve(outcome),
+    onAsyncAction: (action) => asyncActions.push(action),
+  } });
+
+  assert.deepEqual(engine.processServerMessage(call).upstream, []);
+  await vi.waitFor(() => assert.equal(asyncActions.length, 1));
+  const rejected = asyncActions[0].upstream[0];
+  assert.equal(rejected.result.success, false);
+  assert.match(rejected.result.contentItems[0].text, reason);
+  assert.equal(engine.threads.main.activeTurnId, "old-turn");
+  assert.equal(engine.switches.size, 0);
+  assert.equal(asyncActions.flatMap((action) => action.upstream).some((message) => message.method === "turn/interrupt"), false);
+  assert.equal(diagnostics.events.some((event) => event.event === "switch-rejected" && event.phase === "pre-hook"), true);
+});
+
+test("PreModelSwitch hook待機中に利用者が止めたターンを遅いhook結果で再開しない", async () => {
+  let finishHook;
+  let hookSignal;
+  const asyncActions = [];
+  const { engine, call } = beginSwitchTest({ engineOptions: {
+    hookLoader: () => [{ command: "/usr/bin/true", timeout: 5 }],
+    preModelSwitchRunner(_handlers, _event, { signal }) {
+      hookSignal = signal;
+      return new Promise((resolve) => { finishHook = resolve; });
+    },
+    onAsyncAction: (action) => asyncActions.push(action),
+  } });
+
+  engine.processServerMessage(call);
+  await vi.waitFor(() => assert.equal(typeof finishHook, "function"));
+  engine.processClientMessage({ id: "stop", method: "turn/interrupt", params: { threadId: "main", turnId: "old-turn" } });
+  assert.equal(hookSignal.aborted, true);
+  engine.processServerMessage({ method: "turn/completed", params: { threadId: "main", turn: { id: "old-turn", status: "interrupted" } } });
+  finishHook({ allowed: true, hookCount: 1 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(asyncActions.length, 0);
+  assert.equal(engine.switches.size, 0);
+});
+
+test("プロジェクトhooks.jsonの拒否と修正後の許可を実プロセスで切替へ反映する", async () => {
+  const cwd = mkdtempSync(path.join(tmpdir(), 'baton-project-hook-'));
+  mkdirSync(path.join(cwd,'.codex'));
+  const file = path.join(cwd,'.codex','hooks.json');
+  const actions = [];
+  const {engine,call} = beginSwitchTest({cwd, config:makeConfig({enabledRepositories:[cwd]}),
+    engineOptions:{onAsyncAction:action=>actions.push(action)}});
+  const document = command => JSON.stringify({hooks:{SessionStart:[],PreModelSwitch:[{hooks:[{type:'command',command}]}]}});
+  writeFileSync(file,document('printf "policy denied" >&2; exit 2'));
+  assert.deepEqual(engine.processServerMessage(call).upstream,[]);
+  await vi.waitFor(()=>assert.equal(actions.length,1));
+  assert.equal(actions[0].upstream[0].result.success,false);
+  assert.equal(engine.threads.main.activeTurnId,'old-turn');
+  assert.equal(engine.threads.main.selectedModel,'gpt-5.6-sol');
+  writeFileSync(file,'{');
+  assert.match(engine.processServerMessage(call).upstream[0].result.contentItems[0].text,/configuration failed/);
+  writeFileSync(file,document('exit 0'));
+  assert.deepEqual(engine.processServerMessage(call).upstream,[]);
+  await vi.waitFor(()=>assert.equal(actions.length,2));
+  assert.equal(actions[1].upstream[0].result.success,true);
+  const interrupt = engine.processServerMessage({method:'item/completed',params:{threadId:'main',turnId:'old-turn',
+    item:{id:'switch-item',type:'dynamicToolCall',status:'completed',success:true}}}).upstream[0];
+  assert.equal(interrupt.method,'turn/interrupt');
+});
 
 function switch_model(engine, call) {
   const result = engine.processServerMessage(call);
