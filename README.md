@@ -34,6 +34,7 @@ cd /Users/[user_name]/[directory] /Users/[user_name]/baton/bin/baton
 - タスク識別・会話入力・権限・作業場所・作業指示など、中継が維持する制御項目は切り替えリクエストから上書きできない。不正な指定は中断前に拒否する
 - Codexが設定を受け付けても、モデル側でそのまま使われる保証とは異なる。0.153.4の実機では `summary: "concise"` の受付通知を確認した一方、実行記録は `summary: "auto"` だった。中継は値を書き換えず送信する
 - 設定ファイルの編集は、中継の次回起動時に読み込まれる
+- プロジェクトの `.codex/hooks.json` に `PreModelSwitch` を追加すると、切り替え要求の検証後かつ旧ターンの中断前に実行する。設定と実行契約は後述
 - 配布元のモデル選択基準は AI に指示、もしくは設定する
 - 起動するCodex自身から実験的機能を含む通信仕様を生成し、中継に必要な操作・項目・基本的な型・実行状態を確認する。仕様生成の失敗・5秒の時間切れ・必須機能の欠落は理由を表示して起動を拒否する。検査ではタスクを作らず、推論も行わない
 - この検査は中継が使う通信契約の確認であり、将来のCodexの動作すべてを保証するものではない。通信方式自体が変わった場合は中継側の対応が必要
@@ -144,6 +145,65 @@ Codexの `item/completed` でそのツールが成功完了したことを確認
 ```text
 - 選択先のモデルまたは設定が現在と異なる場合だけ、専用ツール switch_model({"model":"モデルID","config":{"effort":"思考量"}}) を直接呼ぶ。config.effort は必須。例: switch_model({"model":"gpt-6-astra","config":{"effort":"high"}})。追加設定は config 内に指定する。同じモデルでも設定変更なら呼び出してよい。他のツールと承認の完了を待ち、単独で呼ぶ。コマンド探索・変更理由の提出は不要。
 ```
+
+## 切り替え前hook
+
+プロジェクトの `.codex/hooks.json` に、既存イベントと並べて `PreModelSwitch` を追加する。Batonが切り替え要求の検証後、受付応答と旧ターンの中断より前に設定順で実行する。`config.json` へのhook登録は不要。
+
+```json
+{
+  "hooks": {
+    "PreModelSwitch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/pre_model_switch.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- `type` は `command` のみ
+- `command` は `/bin/sh -c` で実行するコマンド文字列。作業ディレクトリは対象タスクの `cwd`
+- `timeout` は秒単位の1〜30の整数。省略時は5秒
+- 複数hookは設定順に実行し、許可以外の結果が出た時点で後続を起動しない
+- hookは非同期実行する。待機中も別タスクの通信・停止操作・通知処理を継続する
+- exit code `0` だけが許可。exit code `2` は拒否として標準エラーを理由に使う。それ以外の終了、起動失敗、時間切れ、標準エラーが64 KiBを超えた場合もfail-closedで切り替えを拒否する
+- 拒否時は `switch_model` に `success: false` を返し、旧ターンを中断せずモデル・設定を変更しない
+- hookの標準出力は使用しない。標準エラーへ認証情報などを出力しない
+- `matcher` は省略・空文字・`*` のみ。`async: true` は切替判定を待てなくなるため拒否する。`statusMessage` は受理するがBatonから画面表示はしない
+
+各切替時に、タスクの `cwd` から上へ最寄りの `.codex/hooks.json` を探して再読込する。`.git` のあるディレクトリ、または `enabledRepositories` の範囲の端で探索を止める。ファイルやイベントがなければhookなしで続行し、JSON不正・読込失敗・未対応の `PreModelSwitch` 設定は中断前に拒否する。他イベントはBatonでは実行しない。今回の対象はプロジェクトのファイルのみで、ユーザー共通の `~/.codex/hooks.json` やinline TOMLは読まない。
+
+Codex 0.153.4の `hooks/list` で、`SessionStart` と `PreModelSwitch` の混在時も既存hookが警告・エラーなしで読み込まれることを確認済み。`PreModelSwitch` はCodex本体には認識されず、Batonが実行する。このイベントはCodexのhook信頼レビュー対象にもならないため、Batonで有効化したプロジェクト内の設定として実行する。
+
+各hookの標準入力には、末尾改行付きで次のJSONを渡す。環境変数 `CODEX_BATON_HOOK_EVENT` も `PreModelSwitch` に設定する。
+
+```json
+{
+  "event": "PreModelSwitch",
+  "threadId": "task-id",
+  "turnId": "current-turn-id",
+  "cwd": "/absolute/path/to/repository",
+  "from": {
+    "model": "gpt-5.6-sol",
+    "effort": "high"
+  },
+  "to": {
+    "model": "gpt-6-astra",
+    "config": {
+      "effort": "high"
+    }
+  }
+}
+```
+
+hook実行中に利用者がターンを停止した場合はhookプロセスを終了し、遅れて返った結果から切り替えを再開しない。
 
 ## 記録と検証
 
